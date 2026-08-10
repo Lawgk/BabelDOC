@@ -11,14 +11,45 @@ import openai
 from tenacity import before_sleep_log
 from tenacity import retry
 from tenacity import retry_if_exception_type
-from tenacity import stop_after_attempt
-from tenacity import wait_exponential
+from tenacity import wait_exponential_jitter
 
 from babeldoc.babeldoc_exception.BabelDOCException import ContentFilterError
 from babeldoc.translator.cache import TranslationCache
 from babeldoc.utils.atomic_integer import AtomicInteger
 
 logger = logging.getLogger(__name__)
+
+# Failures where the request never reached a verdict, so another attempt can
+# still produce one: quota pressure, a connection that dropped or timed out
+# (APITimeoutError subclasses APIConnectionError) and any 5xx from the upstream
+# (every status >= 500 is mapped to InternalServerError by the OpenAI SDK).
+#
+# Everything else is deterministic — a malformed request or a content filter
+# returns the same answer however often it is asked, and the caller's fallback
+# path handles it better than a retry loop does.
+_RETRYABLE_ERRORS = (
+    openai.RateLimitError,
+    openai.APIConnectionError,
+    openai.InternalServerError,
+)
+
+# A rate limit clears on its own once the window rolls over, so waiting it out
+# costs nothing but time. A degraded upstream is the opposite: retries run below
+# the QPS limiter, so every worker in the pool retries unthrottled and a blip
+# turns into a stampede. Give up early there and let the caller fall back.
+_RATE_LIMIT_MAX_ATTEMPTS = 100
+_TRANSIENT_MAX_ATTEMPTS = 6
+
+
+def _stop_by_error_kind(retry_state) -> bool:
+    """Cap attempts by failure kind rather than applying one budget to all."""
+    exception = retry_state.outcome.exception() if retry_state.outcome else None
+    limit = (
+        _RATE_LIMIT_MAX_ATTEMPTS
+        if isinstance(exception, openai.RateLimitError)
+        else _TRANSIENT_MAX_ATTEMPTS
+    )
+    return retry_state.attempt_number >= limit
 
 
 def remove_control_characters(s):
@@ -257,9 +288,9 @@ class OpenAITranslator(BaseTranslator):
         self.cache_hit_prompt_token_count = AtomicInteger()
 
     @retry(
-        retry=retry_if_exception_type(openai.RateLimitError),
-        stop=stop_after_attempt(100),
-        wait=wait_exponential(multiplier=1, min=1, max=15),
+        retry=retry_if_exception_type(_RETRYABLE_ERRORS),
+        stop=_stop_by_error_kind,
+        wait=wait_exponential_jitter(initial=1, max=15, jitter=2),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def do_translate(self, text, rate_limit_params: dict = None) -> str:
@@ -289,9 +320,9 @@ class OpenAITranslator(BaseTranslator):
         ]
 
     @retry(
-        retry=retry_if_exception_type(openai.RateLimitError),
-        stop=stop_after_attempt(100),
-        wait=wait_exponential(multiplier=1, min=1, max=15),
+        retry=retry_if_exception_type(_RETRYABLE_ERRORS),
+        stop=_stop_by_error_kind,
+        wait=wait_exponential_jitter(initial=1, max=15, jitter=2),
         before_sleep=before_sleep_log(logger, logging.WARNING),
     )
     def do_llm_translate(self, text, rate_limit_params: dict = None):
