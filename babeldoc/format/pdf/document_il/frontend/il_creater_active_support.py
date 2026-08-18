@@ -51,18 +51,28 @@ class _PassthroughNode:
 
 
 class PassthroughSnapshot:
-    __slots__ = ("tail", "latest_versions", "next_version", "_render_cache")
+    __slots__ = (
+        "tail",
+        "latest_versions",
+        "next_version",
+        "_render_cache",
+        "_resolved",
+    )
 
     def __init__(
         self,
         tail: _PassthroughNode | None = None,
         latest_versions: tuple[tuple[str, int], ...] = (),
         next_version: int = 1,
+        resolved: tuple[tuple[str | None, PassthroughInstruction], ...] | None = None,
     ) -> None:
         self.tail = tail
         self.latest_versions = latest_versions
         self.next_version = next_version
         self._render_cache: dict[bool, str] = {}
+        # Survivors carried forward from the parent; None means resolve()
+        # has to rebuild them by walking the chain.
+        self._resolved = resolved
 
     def __bool__(self) -> bool:
         return self.tail is not None
@@ -77,16 +87,25 @@ class PassthroughSnapshot:
     def event_count(self) -> int:
         return self.tail.length if self.tail is not None else 0
 
+    def resolve(self) -> tuple[tuple[str | None, PassthroughInstruction], ...]:
+        """Surviving (replace_key, instruction) pairs, in chain order."""
+        if self._resolved is None:
+            latest = dict(self.latest_versions)
+            kept: list[tuple[str | None, PassthroughInstruction]] = []
+            node = self.tail
+            while node is not None:
+                if (
+                    node.replace_key is None
+                    or latest.get(node.replace_key) == node.version
+                ):
+                    kept.append((node.replace_key, node.instruction))
+                node = node.parent
+            kept.reverse()
+            self._resolved = tuple(kept)
+        return self._resolved
+
     def to_tuple(self) -> tuple[PassthroughInstruction, ...]:
-        latest = dict(self.latest_versions)
-        kept: list[PassthroughInstruction] = []
-        node = self.tail
-        while node is not None:
-            if node.replace_key is None or latest.get(node.replace_key) == node.version:
-                kept.append(node.instruction)
-            node = node.parent
-        kept.reverse()
-        return tuple(kept)
+        return tuple(instruction for _key, instruction in self.resolve())
 
     def render(self, *, include_clipping: bool = False) -> str:
         if include_clipping in self._render_cache:
@@ -191,6 +210,7 @@ def append_passthrough_instruction(
             tail,
             snapshot.latest_versions,
             snapshot.next_version,
+            (*snapshot.resolve(), (None, instruction)),
         )
     return (*snapshot, instruction)
 
@@ -213,7 +233,11 @@ def replace_first_passthrough_operator(
             *_latest_without_operator(snapshot.latest_versions, operator),
             (operator, version),
         )
-        return PassthroughSnapshot(tail, latest_versions, version + 1)
+        resolved = (
+            *(pair for pair in snapshot.resolve() if pair[0] != operator),
+            (operator, instruction),
+        )
+        return PassthroughSnapshot(tail, latest_versions, version + 1, resolved)
     for index, (op, _arg) in enumerate(snapshot):
         if op == operator:
             return (*snapshot[:index], *snapshot[index + 1 :], instruction)
