@@ -147,6 +147,17 @@ class TextObjectState:
         self.text_matrix = IDENTITY_MATRIX
         self.line_matrix = (0.0, 0.0)
 
+    def begin_implicit(self) -> None:
+        """Enter a text object without touching the matrices.
+
+        For text shown outside BT/ET: viewers render it with whatever text
+        matrix is current, so a preceding stray Tm must survive.
+        """
+        self.in_text_object = True
+
+    def end_implicit(self) -> None:
+        self.in_text_object = False
+
     def set_text_matrix(self, matrix: Matrix) -> None:
         self.text_matrix = matrix
         self.line_matrix = (0.0, 0.0)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 
 from babeldoc.format.pdf.new_parser.pdf_token_serializer import serialize_pdf_token
@@ -13,6 +14,8 @@ from babeldoc.format.pdf.new_parser.tokenizer import PdfName
 from babeldoc.format.pdf.new_parser.tokenizer import PdfOperation
 from babeldoc.format.pdf.new_parser.tokenizer import PdfString
 from babeldoc.format.pdf.new_parser.tokenizer import decode_pdf_name
+
+logger = logging.getLogger(__name__)
 
 
 class UnsupportedOperatorError(ValueError):
@@ -308,6 +311,7 @@ class TextContentInterpreter:
             "'": self._op__tick,
             '"': self._op__quote,
         }
+        self.warned_text_outside_text_object = False
 
     def run(self, operations: list[PdfOperation]) -> list[object]:
         for operation in operations:
@@ -684,8 +688,30 @@ class TextContentInterpreter:
         self._emit_text_show('"', self._require_string(operands[2]).raw)
 
     def _emit_text_show(self, operator: str, text: bytes | list[bytes | float]) -> None:
-        if not self.state.text_object.in_text_object:
-            raise ValueError(f"{operator} used outside a text object.")
+        if self.state.text_object.in_text_object:
+            self._emit_text_show_in_text_object(operator, text)
+            return
+        # The spec forbids text-showing outside BT/ET, but real files do it
+        # (IOPscience cover pages leave two Tj after the closing ET) and every
+        # viewer draws them anyway. Wrap the run in an implicit text object
+        # rather than rejecting the whole document.
+        if not self.warned_text_outside_text_object:
+            self.warned_text_outside_text_object = True
+            logger.warning(
+                "%s used outside a text object; treating it as an implicit BT/ET",
+                operator,
+            )
+        self.state.text_object.begin_implicit()
+        self.sink.emit(BeginTextObjectEvent())
+        try:
+            self._emit_text_show_in_text_object(operator, text)
+        finally:
+            self.state.text_object.end_implicit()
+            self.sink.emit(EndTextObjectEvent())
+
+    def _emit_text_show_in_text_object(
+        self, operator: str, text: bytes | list[bytes | float]
+    ) -> None:
         is_clip_only_text = self.state.text_state.render_mode == 7
         if self.state.text_state.render_mode in {4, 5, 6, 7}:
             self.state.graphics_state.text_clip_active = True
