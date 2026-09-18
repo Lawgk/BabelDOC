@@ -17,6 +17,15 @@ from babeldoc.format.pdf.new_parser.tokenizer import decode_pdf_name
 
 logger = logging.getLogger(__name__)
 
+# Log records carrying this attribute mark input the parser tolerated rather
+# than rejected. Callers attach a handler and filter on it to learn that the
+# output may be degraded without scraping log text.
+DEGRADATION_LOG_ATTR = "babeldoc_degradation"
+
+
+def _degradation(kind: str, detail: str) -> dict[str, dict[str, str]]:
+    return {DEGRADATION_LOG_ATTR: {"kind": kind, "detail": detail}}
+
 
 class UnsupportedOperatorError(ValueError):
     pass
@@ -312,6 +321,7 @@ class TextContentInterpreter:
             '"': self._op__quote,
         }
         self.warned_text_outside_text_object = False
+        self.skipped_operators: set[str] = set()
 
     def run(self, operations: list[PdfOperation]) -> list[object]:
         for operation in operations:
@@ -321,7 +331,18 @@ class TextContentInterpreter:
     def execute(self, operation: PdfOperation) -> None:
         operator = operation.operator
         if operator not in self.SUPPORTED_OPERATORS:
-            raise UnsupportedOperatorError(operator)
+            # Viewers ignore operators they don't know, so the page still
+            # renders. Dropping it here can misplace or lose what follows,
+            # which is why it is surfaced instead of silently ignored.
+            if operator not in self.skipped_operators:
+                self.skipped_operators.add(operator)
+                logger.warning(
+                    "Skipping unknown content-stream operator %r",
+                    operator,
+                    extra=_degradation("unknown_operator", operator),
+                )
+            self.argstack.clear()
+            return
         self._record_text_object_operation(operation)
         handler = self.operator_to_handler[operator]
         operands = [*self.argstack, *operation.operands]
@@ -700,6 +721,7 @@ class TextContentInterpreter:
             logger.warning(
                 "%s used outside a text object; treating it as an implicit BT/ET",
                 operator,
+                extra=_degradation("text_outside_text_object", operator),
             )
         self.state.text_object.begin_implicit()
         self.sink.emit(BeginTextObjectEvent())

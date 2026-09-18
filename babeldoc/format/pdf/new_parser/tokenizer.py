@@ -639,6 +639,10 @@ class ContentStreamTokenizer:
     def _split_composite_keyword(self, raw: str) -> list[object] | None:
         if raw in CONTENT_KEYWORDS:
             return None
+        # PDFium writes "Qq" / "qq" with no separator. No other keyword starts
+        # with q or Q, so a run of them splits unambiguously.
+        if len(raw) > 1 and all(ch in "qQ" for ch in raw):
+            return [PdfKeyword(ch) for ch in raw]
         if not any(ch.isdigit() for ch in raw):
             return None
 
