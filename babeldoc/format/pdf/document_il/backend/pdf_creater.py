@@ -37,6 +37,10 @@ _EXTGSTATE_USAGE_RE = re.compile(rb"/([!#$%&'*+,\-.0-9:;=?@A-Z\\^_`a-z{|}~]+)\s+
 _SHADING_USAGE_RE = re.compile(rb"/([!#$%&'*+,\-.0-9:;=?@A-Z\\^_`a-z{|}~]+)\s+sh\b")
 
 
+# Sort key given to units without a render order: they draw after every ordered unit.
+UNORDERED_RENDER_ORDER = 9999999999999999
+
+
 class RenderUnit(ABC):
     """Abstract base class for all renderable units."""
 
@@ -50,9 +54,9 @@ class RenderUnit(ABC):
         self.sub_render_order = sub_render_order
         self.xobj_id = xobj_id
         if self.render_order is None:
-            self.render_order = 9999999999999999
+            self.render_order = UNORDERED_RENDER_ORDER
         if self.sub_render_order is None:
-            self.sub_render_order = 9999999999999999
+            self.sub_render_order = UNORDERED_RENDER_ORDER
 
     @abstractmethod
     def render(
@@ -880,14 +884,23 @@ class PDFCreater:
 
         # Convert rectangles to render units (only for OCR workaround or debug)
         for i, rect in enumerate(page.pdf_rectangle):
-            if (
+            is_ocr_cover = (
                 translation_config.ocr_workaround
                 and not rect.debug_info
                 and rect.fill_background
-            ) or (translation_config.debug and rect.debug_info):
-                render_order = getattr(
-                    rect, "render_order", 10
-                )  # Rectangles render first
+            )
+            if is_ocr_cover or (translation_config.debug and rect.debug_info):
+                if is_ocr_cover:
+                    # OCR mode clears every char's render order. Sharing that
+                    # unordered key would leave covers and text to unrelated sub
+                    # orders, putting short untranslated runs (table cells, page
+                    # numbers) under a cover. Covers go after all ordered content
+                    # (the scan, paths) and before any text.
+                    render_order = UNORDERED_RENDER_ORDER - 1
+                else:
+                    render_order = getattr(
+                        rect, "render_order", 10
+                    )  # Rectangles render first
                 sub_render_order = getattr(rect, "sub_render_order", i)
                 line_width = 0.1 if translation_config.ocr_workaround else 0.4
                 render_units.append(
