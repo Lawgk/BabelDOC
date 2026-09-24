@@ -48,9 +48,10 @@ class PreparedPdfPage:
 
 
 def legacy_page_cropbox(page: PreparedPdfPage) -> tuple[float, float, float, float]:
+    # No swap for /Rotate 90/270: the IL keeps content in unrotated user space,
+    # and the renderer subtracts this box's origin as the page offset. Swapping
+    # made that origin (y0, x1), which pushed the whole page off by its width.
     x0, y0, x1, y1 = page.cropbox
-    if page.rotate in (90, 270):
-        return float(y0), float(x1), float(y1), float(x0)
     return float(x0), float(y0), float(x1), float(y1)
 
 

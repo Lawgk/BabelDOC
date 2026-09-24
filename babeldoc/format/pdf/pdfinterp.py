@@ -408,8 +408,7 @@ class PDFPageInterpreterEx(PDFPageInterpreter):
         # ctm_for_ops = copy.copy(ctm)
         ctm_for_ops = (1, 0, 0, 1, -x0, -y0)
         ctm = (1, 0, 0, 1, -x0, -y0)
-        if page.rotate == 90 or page.rotate == 270:
-            (x0, y0, x1, y1) = (y0, x1, y1, x0)
+        # The crop box stays unswapped on rotated pages; see legacy_page_cropbox.
         self.il_creater.on_page_start()
         self.il_creater.on_page_crop_box(x0, y0, x1, y1)
         self.device.begin_page(page, ctm)
