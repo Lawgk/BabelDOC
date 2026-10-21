@@ -27,6 +27,7 @@ from babeldoc.format.pdf.document_il.utils.layout_helper import calculate_iou_fo
 from babeldoc.format.pdf.document_il.utils.layout_helper import (
     calculate_y_true_iou_for_boxes,
 )
+from babeldoc.format.pdf.document_il.utils.layout_helper import floating_accent_bases
 from babeldoc.format.pdf.document_il.utils.layout_helper import is_bullet_point
 from babeldoc.format.pdf.document_il.utils.layout_helper import (
     is_curve_in_figure_table_layout,
@@ -410,6 +411,7 @@ class StylesAndFormulas:
         in_formula_state = False
         in_corner_mark_state = False
         corner_mark_info = []
+        accent_bases = floating_accent_bases(line.pdf_character)
 
         # Determine the `is_formula` tag for each character
         for i, char in enumerate(line.pdf_character):
@@ -504,7 +506,7 @@ class StylesAndFormulas:
 
             is_formula = is_formula or is_corner_mark
 
-            if char.char_unicode == " ":
+            if char.char_unicode == " " or i in accent_bases:
                 is_formula = in_formula_state
 
             # This simulates the state change for the next iteration
@@ -514,6 +516,11 @@ class StylesAndFormulas:
             in_corner_mark_state = is_corner_mark
             is_formula_tags.append(is_formula)
             corner_mark_info.append(is_corner_mark)
+
+        # 浮动重音跟随它叠着的字母，不单独成为公式
+        for i, j in accent_bases.items():
+            is_formula_tags[i] = is_formula_tags[j]
+            corner_mark_info[i] = corner_mark_info[j]
 
         for char, is_formula, is_corner_mark in zip(
             line.pdf_character, is_formula_tags, corner_mark_info, strict=False

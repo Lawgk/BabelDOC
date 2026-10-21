@@ -222,6 +222,55 @@ def get_paragraph_unicode(paragraph: PdfParagraph) -> str:
 
 SPACE_REGEX = regex.compile(r"\s+", regex.UNICODE)
 
+# 间距重音符 → 对应的组合附加符。有些 PDF 把带重音的字母画成「裸字母 + 叠在上面的重音字形」：
+# Advent 3B2 先画字母再画重音，TeX 的 \accent 先画重音再画字母。
+FLOATING_ACCENTS = {
+    "`": "\u0300",
+    "´": "\u0301",
+    "ˆ": "\u0302",
+    "˜": "\u0303",
+    "¯": "\u0304",
+    "˘": "\u0306",
+    "˙": "\u0307",
+    "¨": "\u0308",
+    "˚": "\u030a",
+    "˝": "\u030b",
+    "ˇ": "\u030c",
+    "¸": "\u0327",
+    "˛": "\u0328",
+}
+
+
+def floating_accent_bases(chars: list[PdfCharacter | str]) -> dict[int, int]:
+    """
+    找出叠在相邻字母上的浮动重音，返回 {重音下标: 字母下标}。
+    判定：同一字体，重音的水平中心落在字母的框内，且两者纵向重叠。
+    """
+    bases = {}
+    for i, char in enumerate(chars):
+        if (
+            not isinstance(char, PdfCharacter)
+            or char.char_unicode not in FLOATING_ACCENTS
+        ):
+            continue
+        center = (char.box.x + char.box.x2) / 2
+        for j in (i - 1, i + 1):
+            base = chars[j] if 0 <= j < len(chars) else None
+            if (
+                isinstance(base, PdfCharacter)
+                and base.char_unicode is not None
+                and len(base.char_unicode) == 1
+                and base.char_unicode.isalpha()
+                and base.char_unicode not in FLOATING_ACCENTS
+                and base.pdf_style.font_id == char.pdf_style.font_id
+                and base.box.x <= center <= base.box.x2
+                and base.box.y < char.box.y2
+                and char.box.y < base.box.y2
+            ):
+                bases[i] = j
+                break
+    return bases
+
 
 def get_char_unicode_string(chars: list[PdfCharacter | str]) -> str:
     """
@@ -256,6 +305,17 @@ def get_char_unicode_string(chars: list[PdfCharacter | str]) -> str:
     else:
         median_distance = distinct_distances[1]
 
+    # 叠在字母上的浮动重音并入该字母，NFKC 合成为带重音的字母。
+    # 放在间距统计之后，免得改变其他位置的空格判定。
+    accent_bases = floating_accent_bases(chars)
+    marks: dict[int, str] = {}
+    for i, j in accent_bases.items():
+        base_id = id(chars[j])
+        marks[base_id] = (
+            marks.get(base_id, "") + FLOATING_ACCENTS[chars[i].char_unicode]
+        )
+    chars = [char for i, char in enumerate(chars) if i not in accent_bases]
+
     # 构建 unicode 字符串，根据间距插入空格
     unicode_chars = []
     for i in range(len(chars)):
@@ -269,7 +329,9 @@ def get_char_unicode_string(chars: list[PdfCharacter | str]) -> str:
             regex.sub(
                 r"\s+",
                 " ",
-                unicodedata.normalize("NFKC", chars[i].char_unicode),
+                unicodedata.normalize(
+                    "NFKC", chars[i].char_unicode + marks.get(id(chars[i]), "")
+                ),
             )
         )
 
