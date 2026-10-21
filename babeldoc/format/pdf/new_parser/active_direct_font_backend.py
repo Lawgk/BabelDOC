@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from io import BytesIO
@@ -362,6 +363,7 @@ def _build_simple_font_backend(
         encoding_db=EncodingDB,
         literal_name=literal_name,
     )
+    _decode_numeric_glyph_names(spec, basefont, cid2unicode)
     unicode_map = build_simple_unicode_map(
         spec,
         stream_value=stream_value,
@@ -589,17 +591,63 @@ def _build_simple_encoding_map(
     if isinstance(encoding, dict):
         name = literal_name(encoding.get("BaseEncoding", STANDARD_ENCODING_NAME))
         cid2unicode = encoding_db.get_encoding(name).copy()
-        diff = list_value(encoding.get("Differences", []))
-        if diff:
-            cid = 0
-            for item in diff:
-                if isinstance(item, int):
-                    cid = item
-                    continue
-                try:
-                    cid2unicode[cid] = name2unicode(literal_name(item))
-                except (KeyError, ValueError):
-                    pass
-                cid += 1
+        for cid, glyph_name in _differences(encoding, literal_name):
+            try:
+                cid2unicode[cid] = name2unicode(glyph_name)
+            except (KeyError, ValueError):
+                pass
         return cid2unicode
     return encoding_db.get_encoding(literal_name(encoding))
+
+
+def _differences(encoding: Mapping[object, object], literal_name):
+    cid = 0
+    for item in list_value(encoding.get("Differences", [])):
+        if isinstance(item, int):
+            cid = item
+            continue
+        yield cid, literal_name(item)
+        cid += 1
+
+
+_NUMERIC_GLYPH_NAME = re.compile(r"C(\d{1,3})")
+_SYMBOL_FONT_NAME = re.compile(r"Pi\d*$|Symbol|Greek|Math")
+
+
+def _decode_numeric_glyph_names(
+    spec: Mapping[object, object],
+    basefont: str | bytes,
+    cid2unicode: dict[int, str],
+) -> None:
+    """Decode Differences that name every glyph /C<n> after its old code.
+
+    PDFlib PLOP rewrites of Advent 3B2 journal PDFs renumber each subset
+    font to codes 1..N, name glyph /C<n> after its code n in the original
+    font and drop ToUnicode. AGL knows none of these names, so the codes
+    fall back to the base encoding and decode as (cid:N) or shifted ASCII;
+    too few to trip the CID checks, the garbage gets translated.
+
+    Symbol fonts are named the same way, but their original codes are not
+    base-encoding characters (/C97 is alpha), and nothing in the font tells
+    them apart. Fonts named as symbol fonts, fonts with codes the base
+    encoding lacks, and subsets of one or two glyphs (too small to judge)
+    keep the old decoding; their CID characters render as original glyphs.
+    """
+    encoding = spec.get("Encoding")
+    if not isinstance(encoding, dict):
+        return
+    if isinstance(basefont, bytes):
+        basefont = basefont.decode("latin-1")
+    if _SYMBOL_FONT_NAME.search(basefont):
+        return
+    base = EncodingDB.get_encoding(
+        literal_name(encoding.get("BaseEncoding", STANDARD_ENCODING_NAME))
+    )
+    decoded = {}
+    for cid, glyph_name in _differences(encoding, literal_name):
+        match = _NUMERIC_GLYPH_NAME.fullmatch(glyph_name)
+        if match is None or int(match.group(1)) not in base:
+            return
+        decoded[cid] = base[int(match.group(1))]
+    if len(decoded) > 2:
+        cid2unicode.update(decoded)
