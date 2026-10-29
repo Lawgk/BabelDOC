@@ -1,4 +1,5 @@
 import asyncio
+import functools
 import logging
 import threading
 import time
@@ -29,6 +30,9 @@ class ProgressMonitor:
         self.total_parts = total_parts
         self.raw_stages = stages
         self.part_results = {}
+        # Set by a caller that prepares parts ahead of time: only this part's progress is
+        # reported, so overall progress never jumps between parts. None reports every part.
+        self.reporting_part_index: int | None = None
 
         # Convert stages list to dict with name and weight
         self.stage = {}
@@ -75,7 +79,9 @@ class ProgressMonitor:
         """Create a new progress monitor for a document part"""
         return ProgressMonitor(
             stages=self.raw_stages,
-            progress_change_callback=self._handle_part_progress,
+            progress_change_callback=functools.partial(
+                self._handle_part_progress, part_index
+            ),
             finish_callback=self._handle_part_finish,
             report_interval=self.report_interval,
             cancel_event=self.cancel_event,
@@ -85,8 +91,11 @@ class ProgressMonitor:
             total_parts=total_parts,
         )
 
-    def _handle_part_progress(self, **kwargs):
+    def _handle_part_progress(self, source_part: int, **kwargs):
         """Handle progress updates from part monitors"""
+        reporting = self.reporting_part_index
+        if reporting is not None and source_part != reporting:
+            return
         if self.progress_change_callback and not self.disable:
             # Add part information to progress update
             kwargs["part_index"] = kwargs.get("part_index")

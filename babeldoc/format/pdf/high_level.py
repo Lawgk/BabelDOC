@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import dataclasses
 import hashlib
 import io
 import logging
@@ -9,6 +10,8 @@ import shutil
 import threading
 import time
 from asyncio import CancelledError
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -49,6 +52,7 @@ from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.document_il.xml_converter import XMLConverter
 from babeldoc.format.pdf.result_merger import ResultMerger
 from babeldoc.format.pdf.split_manager import SplitManager
+from babeldoc.format.pdf.split_manager import SplitPoint
 from babeldoc.format.pdf.translation_config import TranslateResult
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
@@ -565,110 +569,67 @@ def do_translate(
                     else:
                         pm.total_parts = len(split_points)
 
-                        # Process parts serially
                         results: dict[int, TranslateResult | None] = {}
                         original_watermark_mode = (
                             translation_config.watermark_output_mode
                         )
                         original_doc = Document(original_pdf_path)
-                        for i, split_point in enumerate(split_points):
-                            try:
-                                # Create a copy of config for this part
-                                part_config = copy.copy(translation_config)
-                                part_config.skip_clean = True
-                                should_translate_pages = []
-                                for page in range(
-                                    split_point.start_page, split_point.end_page + 1
-                                ):
-                                    if translation_config.should_translate_page(
-                                        page + 1
-                                    ):
-                                        should_translate_pages.append(
-                                            page - split_point.start_page + 1
+                        # Parsing and layout are CPU-bound while translation mostly waits on
+                        # the LLM, so part i+1 is prepared in the background while part i is
+                        # translated. Never more than one part ahead, to bound memory.
+                        prefetch = ThreadPoolExecutor(
+                            max_workers=1, thread_name_prefix="babeldoc-part-prefetch"
+                        )
+                        next_part: Future | None = None
+                        try:
+                            for i in range(len(split_points)):
+                                try:
+                                    pm.reporting_part_index = i
+                                    if next_part is None:
+                                        prepared_part = _prepare_part(
+                                            pm,
+                                            translation_config,
+                                            original_doc,
+                                            split_points,
+                                            i,
                                         )
-                                part_config.pages = None
-                                part_config.page_ranges = [
-                                    (x, x) for x in should_translate_pages
-                                ]
-                                if (
-                                    translation_config.only_include_translated_page
-                                    and not should_translate_pages
-                                ):
-                                    results[i] = None
-                                    continue
-
-                                # Only first part should do scanned detection if enabled
-                                if i > 0:
-                                    part_config.skip_scanned_detection = True
-
-                                part_config.working_dir = (
-                                    translation_config.get_part_working_dir(i)
-                                )
-                                part_config.output_dir = (
-                                    translation_config.get_part_output_dir(i)
-                                )
-
-                                assert id(
-                                    part_config.shared_context_cross_split_part
-                                ) == id(
-                                    translation_config.shared_context_cross_split_part
-                                ), "shared_context_cross_split_part must be the same"
-
-                                part_temp_input_path = (
-                                    part_config.get_working_file_path(
-                                        f"input.part{i}.pdf"
-                                    )
-                                )
-                                part_config.input_file = part_temp_input_path
-
-                                temp_doc = Document()
-                                for x in range(
-                                    split_point.start_page, split_point.end_page + 1
-                                ):
-                                    xref = original_doc[x].xref
-                                    if (
-                                        original_doc.xref_get_key(xref, "Annots")[0]
-                                        != "null"
-                                    ):
-                                        original_doc.xref_set_key(
-                                            xref, "Annots", "null"
+                                    else:
+                                        wait_start = time.time()
+                                        prepared_part = next_part.result()
+                                        next_part = None
+                                        logger.info(
+                                            f"part {i} was prepared ahead, "
+                                            f"waited {time.time() - wait_start:.1f}s for it"
                                         )
-                                temp_doc.insert_pdf(
-                                    original_doc,
-                                    from_page=split_point.start_page,
-                                    to_page=split_point.end_page,
-                                )
-                                safe_save(temp_doc, part_temp_input_path)
-                                assert (
-                                    temp_doc.page_count
-                                    == split_point.end_page - split_point.start_page + 1
-                                )
-
-                                # Only first part should have watermark
-                                if i > 0:
-                                    part_config.watermark_output_mode = (
-                                        WatermarkOutputMode.NoWatermark
-                                    )
-
-                                # Create progress monitor for this part
-                                part_monitor = pm.create_part_monitor(
-                                    i, len(split_points)
-                                )
-
-                                # Process this part
-                                result = _do_translate_single(
-                                    part_monitor,
-                                    part_config,
-                                )
-                                results[i] = result
-
-                            except Exception as e:
-                                logger.error(f"Error in part {i}: {e}")
-                                pm.translate_error(e)
-                                raise
-                            finally:
-                                # Clean up part working directory
-                                translation_config.cleanup_part_working_dir(i)
+                                    if i + 1 < len(split_points):
+                                        next_part = prefetch.submit(
+                                            _prepare_part,
+                                            pm,
+                                            translation_config,
+                                            original_doc,
+                                            split_points,
+                                            i + 1,
+                                        )
+                                    results[i] = _finish_part(prepared_part)
+                                    # Release this part's IL before waiting for the next one
+                                    prepared_part = None
+                                except Exception as e:
+                                    logger.error(f"Error in part {i}: {e}")
+                                    pm.translate_error(e)
+                                    raise
+                                finally:
+                                    # Clean up part working directory
+                                    translation_config.cleanup_part_working_dir(i)
+                        finally:
+                            if (
+                                next_part is not None
+                                and not next_part.done()
+                                and pm.cancel_event is not None
+                            ):
+                                # Only on failure: stop the part being prepared before its
+                                # working directory is removed.
+                                pm.cancel_event.set()
+                            prefetch.shutdown(wait=True)
 
                         # Restore original watermark mode
                         translation_config.watermark_output_mode = (
@@ -833,11 +794,109 @@ def check_cid_char(il: il_version_1.Document):
     return cid_count > len(chars) * 0.8
 
 
+@dataclasses.dataclass
+class _PreparedDocument:
+    """A document or part after the stages that run before translation."""
+
+    docs: il_version_1.Document
+    doc_pdf2zh: Document
+    temp_pdf_path: Path
+    mediabox_data: dict
+
+
 def _do_translate_single(
     pm: ProgressMonitor,
     translation_config: TranslationConfig,
 ) -> TranslateResult:
     """Original translation logic for a single document or part"""
+    prepared = _prepare_single(pm, translation_config)
+    if prepared is None:
+        return None
+    return _finish_single(translation_config, prepared)
+
+
+def _prepare_part(
+    pm: ProgressMonitor,
+    translation_config: TranslationConfig,
+    original_doc: Document,
+    split_points: list[SplitPoint],
+    i: int,
+) -> tuple[TranslationConfig, _PreparedDocument | None] | None:
+    """Cut part i out of the original PDF and run the stages before translation.
+
+    Returns None when the part has no page to translate and untranslated pages are dropped.
+    """
+    start_time = time.time()
+    split_point = split_points[i]
+    # Create a copy of config for this part
+    part_config = copy.copy(translation_config)
+    part_config.skip_clean = True
+    should_translate_pages = []
+    for page in range(split_point.start_page, split_point.end_page + 1):
+        if translation_config.should_translate_page(page + 1):
+            should_translate_pages.append(page - split_point.start_page + 1)
+    part_config.pages = None
+    part_config.page_ranges = [(x, x) for x in should_translate_pages]
+    if translation_config.only_include_translated_page and not should_translate_pages:
+        return None
+
+    # Only first part should do scanned detection if enabled
+    if i > 0:
+        part_config.skip_scanned_detection = True
+
+    part_config.working_dir = translation_config.get_part_working_dir(i)
+    part_config.output_dir = translation_config.get_part_output_dir(i)
+
+    assert id(part_config.shared_context_cross_split_part) == id(
+        translation_config.shared_context_cross_split_part
+    ), "shared_context_cross_split_part must be the same"
+
+    part_temp_input_path = part_config.get_working_file_path(f"input.part{i}.pdf")
+    part_config.input_file = part_temp_input_path
+
+    temp_doc = Document()
+    for x in range(split_point.start_page, split_point.end_page + 1):
+        xref = original_doc[x].xref
+        if original_doc.xref_get_key(xref, "Annots")[0] != "null":
+            original_doc.xref_set_key(xref, "Annots", "null")
+    temp_doc.insert_pdf(
+        original_doc,
+        from_page=split_point.start_page,
+        to_page=split_point.end_page,
+    )
+    safe_save(temp_doc, part_temp_input_path)
+    assert temp_doc.page_count == split_point.end_page - split_point.start_page + 1
+
+    # Only first part should have watermark
+    if i > 0:
+        part_config.watermark_output_mode = WatermarkOutputMode.NoWatermark
+
+    # Create progress monitor for this part
+    part_monitor = pm.create_part_monitor(i, len(split_points))
+    prepared = _prepare_single(part_monitor, part_config)
+    logger.info(f"part {i} prepared in {time.time() - start_time:.1f}s")
+    return part_config, prepared
+
+
+def _finish_part(
+    prepared_part: tuple[TranslationConfig, _PreparedDocument | None] | None,
+) -> TranslateResult | None:
+    if prepared_part is None:
+        return None
+    part_config, prepared = prepared_part
+    if prepared is None:
+        return None
+    return _finish_single(part_config, prepared)
+
+
+def _prepare_single(
+    pm: ProgressMonitor,
+    translation_config: TranslationConfig,
+) -> _PreparedDocument | None:
+    """Parse the PDF and run the CPU-bound stages that come before translation.
+
+    Returns None when only translated pages are kept and none is left.
+    """
     translation_config.progress_monitor = pm
 
     if translation_config.shared_context_cross_split_part.auto_enabled_ocr_workaround:
@@ -924,12 +983,7 @@ def _do_translate_single(
 
     # Skip all translation processing if only_parse_generate_pdf is enabled
     if translation_config.only_parse_generate_pdf:
-        logger.debug("only_parse_generate_pdf enabled, skipping translation processing")
-        # Skip directly to PDF generation
-        pdf_creater = PDFCreater(temp_pdf_path, docs, translation_config, mediabox_data)
-        result = pdf_creater.write(translation_config)
-        result.original_pdf_path = translation_config.input_file
-        return result
+        return _PreparedDocument(docs, doc_pdf2zh, temp_pdf_path, mediabox_data)
 
     # Rest of the original translation logic...
     # [Previous implementation of do_translate continues here]
@@ -982,6 +1036,29 @@ def _do_translate_single(
             docs,
             translation_config.get_working_file_path("styles_and_formulas.json"),
         )
+
+    return _PreparedDocument(docs, doc_pdf2zh, temp_pdf_path, mediabox_data)
+
+
+def _finish_single(
+    translation_config: TranslationConfig,
+    prepared: _PreparedDocument,
+) -> TranslateResult:
+    """Translate a prepared document or part, typeset it and write the PDFs."""
+    docs = prepared.docs
+    doc_pdf2zh = prepared.doc_pdf2zh
+    temp_pdf_path = prepared.temp_pdf_path
+    mediabox_data = prepared.mediabox_data
+    xml_converter = XMLConverter()
+
+    # Skip all translation processing if only_parse_generate_pdf is enabled
+    if translation_config.only_parse_generate_pdf:
+        logger.debug("only_parse_generate_pdf enabled, skipping translation processing")
+        # Skip directly to PDF generation
+        pdf_creater = PDFCreater(temp_pdf_path, docs, translation_config, mediabox_data)
+        result = pdf_creater.write(translation_config)
+        result.original_pdf_path = translation_config.input_file
+        return result
 
     translate_engine = translation_config.translator
     term_extraction_engine = translation_config.get_term_extraction_translator()
