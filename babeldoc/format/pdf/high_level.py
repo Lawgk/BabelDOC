@@ -454,6 +454,42 @@ def fix_null_page_content(doc: Document) -> list[int]:
     return invalid_page
 
 
+def derotate_upright_pages(doc: Document) -> list[int]:
+    """Bake /Rotate into the content of pages whose text only reads horizontally
+    once the rotation is applied.
+
+    The IL works in unrotated user space. A landscape page printed through
+    PostScript draws its content turned against /Rotate, so there every glyph runs
+    vertically: layout detection sees sideways text and the paragraphs never reach
+    the translator. Pages whose text already runs horizontally in user space keep
+    their /Rotate.
+    """
+    derotated = []
+    for page in doc:
+        if page.rotation == 0:
+            continue
+        try:
+            m = page.rotation_matrix
+            horizontal_now = horizontal_rotated = 0
+            text = page.get_text("dict", flags=pymupdf.TEXTFLAGS_TEXT)
+            for block in text["blocks"]:
+                for line in block.get("lines", []):
+                    chars = sum(len(span["text"]) for span in line["spans"])
+                    dx, dy = line["dir"]
+                    if dx > 0.99:
+                        horizontal_now += chars
+                    if dx * m.a + dy * m.c > 0.99:
+                        horizontal_rotated += chars
+            if horizontal_rotated > horizontal_now:
+                page.remove_rotation()
+                derotated.append(page.number)
+        except Exception:
+            logger.warning(f"failed to derotate page {page.number}", exc_info=True)
+    if derotated:
+        logger.info(f"derotated {len(derotated)} pages whose text reads upright")
+    return derotated
+
+
 def fix_null_xref(doc: Document) -> None:
     """Fix null xref in PDF file by replacing them with empty arrays.
 
@@ -928,6 +964,9 @@ def _prepare_single(
     invalid_pages = []
     try:
         invalid_pages = fix_null_page_content(doc_pdf2zh)
+        # Before fix_filter, which merges the cm stream prepended here, and before
+        # fix_media_box, which records the boxes restored on output.
+        derotate_upright_pages(doc_pdf2zh)
         fix_filter(doc_pdf2zh)
         fix_null_xref(doc_pdf2zh)
     except Exception:
