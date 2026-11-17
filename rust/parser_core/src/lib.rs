@@ -883,18 +883,14 @@ impl Parser {
         }
         observer.start(views.len())?;
         let mut pages = Vec::new();
-        for (n, raw, rotate, resources, data) in views {
+        for (n, raw, _rotate, resources, data) in views {
             observer.page_start()?;
             self.table.begin_page_scope();
-            let crop = if !self
-                .config
-                .visual_roundtrip_mode
-                && [90, 270].contains(&rotate.rem_euclid(360))
-            {
-                [raw[1], raw[2], raw[3], raw[0]]
-            } else {
-                raw
-            };
+            // No swap for /Rotate 90/270: the IL keeps content in unrotated
+            // user space, and the writer subtracts this box's origin as the
+            // page offset. Swapping made that origin (y0, x1), which pushed
+            // the whole page off by its width and left it blank.
+            let crop = raw;
             self.page = ir::DataPage {
                 page_number: Some(n as i64),
                 unit: Some("point".into()),
