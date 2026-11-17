@@ -643,6 +643,7 @@ struct Parser {
     end_operations: HashMap<Vec<String>, String>,
     valid_text: Vec<Vec<String>>,
     warned_text_outside_text_object: bool,
+    skipped_operators: HashSet<String>,
 }
 pub struct Parsed {
     pub document: ir::Document,
@@ -782,6 +783,7 @@ fn parse_loaded_with_diagnostics(
         end_operations: HashMap::new(),
         valid_text: vec![],
         warned_text_outside_text_object: false,
+        skipped_operators: HashSet::new(),
     };
     let result = p.run(observer);
     #[cfg(test)]
@@ -1116,6 +1118,7 @@ impl Parser {
                         self.warned_text_outside_text_object = true;
                         log::warn!(
                             target: "babeldoc.parser",
+                            degradation = "text_outside_text_object", detail = op;
                             "{op} used outside a text object; treating it as an implicit BT/ET"
                         );
                     }
@@ -1475,7 +1478,23 @@ impl Parser {
                     }
                 }
                 "MP" | "DP" | "BMC" | "BDC" | "EMC" | "BX" | "EX" => {}
-                _ => return Err(Error::new("UnsupportedOperatorError", op)),
+                _ => {
+                    // Viewers ignore operators they don't know, so the page
+                    // still renders. Skip it with its operands (already taken
+                    // off the stack) and keep it out of the text-clip replay.
+                    // Dropping it can misplace or lose what follows, so it is
+                    // surfaced as a degradation rather than silently ignored.
+                    if state.in_text {
+                        text_ops.pop();
+                    }
+                    if self.skipped_operators.insert(op.to_owned()) {
+                        log::warn!(
+                            target: "babeldoc.parser",
+                            degradation = "unknown_operator", detail = op;
+                            "Skipping unknown content-stream operator '{op}'"
+                        );
+                    }
+                }
             }
             if buffered.len() >= 2048 {
                 self.flush(&mut buffered, expansion)?

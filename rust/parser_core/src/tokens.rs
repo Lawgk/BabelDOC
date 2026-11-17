@@ -236,6 +236,13 @@ fn composite_keyword(raw: &[u8]) -> Result<Option<std::collections::VecDeque<Tok
         "TL", "Tf", "Tr", "Ts", "Td", "TD", "Tm", "T*", "Tj", "TJ", "'", "\"", "CS", "cs", "SC",
         "SCN", "sc", "scn", "G", "g", "RG", "rg", "K", "k", "d0", "d1", "true", "false", "null",
     ];
+    // PDFium writes "Qq" and "qq" with no separator. No other keyword starts
+    // with q or Q, so a run of them splits unambiguously.
+    if is_glued_save_restore(raw) {
+        return Ok(Some(
+            raw.iter().map(|&byte| Token::Word(char::from(byte).into())).collect(),
+        ));
+    }
     if !raw.iter().copied().any(latin1_digit)
         || KEYWORDS.iter().any(|keyword| raw == keyword.as_bytes())
     {
@@ -302,6 +309,9 @@ fn composite_keyword(raw: &[u8]) -> Result<Option<std::collections::VecDeque<Tok
         rest = &rest[keyword.len()..];
     }
     Ok((tokens.len() > 1).then_some(tokens))
+}
+fn is_glued_save_restore(raw: &[u8]) -> bool {
+    raw.len() > 1 && raw.iter().all(|byte| matches!(byte, b'q' | b'Q'))
 }
 fn ws(b: u8) -> bool {
     b" \t\r\n\x0c\0".contains(&b)
@@ -619,6 +629,7 @@ impl<'a> Lexer<'a> {
             b"gs",
         ]
         .contains(&token)
+            || is_glued_save_restore(token)
     }
     pub fn operation(&mut self) -> Result<Option<Operation>> {
         let mut args = Vec::new();

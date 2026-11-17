@@ -27,6 +27,48 @@ struct QueuedRecord {
     level: Level,
     message: String,
     created: f64,
+    degradation: Option<Degradation>,
+}
+
+/// Input the parser tolerated rather than rejected, logged as
+/// `degradation = <kind>, detail = <what>` key-values. It reaches Python as a
+/// `babeldoc_degradation` record attribute so a caller can collect it and flag
+/// the output as possibly degraded without scraping log text.
+struct Degradation {
+    kind: String,
+    detail: String,
+}
+
+const DEGRADATION_LOG_ATTR: &str = "babeldoc_degradation";
+
+#[derive(Default)]
+struct DegradationVisitor {
+    kind: Option<String>,
+    detail: Option<String>,
+}
+
+impl<'kvs> log::kv::VisitSource<'kvs> for DegradationVisitor {
+    fn visit_pair(
+        &mut self,
+        key: log::kv::Key<'kvs>,
+        value: log::kv::Value<'kvs>,
+    ) -> Result<(), log::kv::Error> {
+        match key.as_str() {
+            "degradation" => self.kind = Some(value.to_string()),
+            "detail" => self.detail = Some(value.to_string()),
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
+fn degradation(record: &Record<'_>) -> Option<Degradation> {
+    let mut visitor = DegradationVisitor::default();
+    record.key_values().visit(&mut visitor).ok()?;
+    Some(Degradation {
+        kind: visitor.kind?,
+        detail: visitor.detail.unwrap_or_default(),
+    })
 }
 
 struct PythonLogger {
@@ -76,6 +118,7 @@ impl Log for PythonLogger {
             level: record.level(),
             message: record.args().to_string(),
             created,
+            degradation: degradation(record),
         });
         if let Ok(sender) = self.sender.lock()
             && let Some(sender) = sender.as_ref()
@@ -354,6 +397,12 @@ fn deliver(py: Python<'_>, record: &QueuedRecord) {
             (&record.target, level, "", 0, &record.message, (), py.None()),
         )?;
         python_record.setattr("created", record.created)?;
+        if let Some(degradation) = &record.degradation {
+            let marker = pyo3::types::PyDict::new(py);
+            marker.set_item("kind", &degradation.kind)?;
+            marker.set_item("detail", &degradation.detail)?;
+            python_record.setattr(DEGRADATION_LOG_ATTR, marker)?;
+        }
         logger.call_method1("handle", (python_record,))?;
         Ok(())
     })();
