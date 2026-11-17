@@ -260,6 +260,7 @@ impl Document {
                 self.history.nodes.push(node);
             }
         }
+        self.history.reset_resolved();
         indices
     }
 }

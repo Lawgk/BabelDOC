@@ -3,6 +3,7 @@
 #![forbid(unsafe_code)]
 pub use babeldoc_il_types::{PythonValue, RuntimeBool};
 mod compact_values;
+mod survivors;
 pub use compact_values::{CurveCtm, DataPdfPath, PathOp};
 use serde_json::Value as Json;
 use std::io::Read;
@@ -674,6 +675,8 @@ pub struct HistoryNode {
 pub struct History {
     nodes: Vec<HistoryNode>,
     base: usize,
+    /// One slot per node, filled on demand; see `survivors`.
+    resolved: Vec<survivors::ResolvedSlot>,
 }
 impl History {
     pub fn push(&mut self, mut node: HistoryNode) -> usize {
@@ -685,6 +688,7 @@ impl History {
             .checked_add(self.nodes.len())
             .expect("history key space exhausted");
         self.nodes.push(node);
+        self.resolved.push(Default::default());
         i
     }
     fn index(&self, key: usize) -> Result<usize, AccessError> {
@@ -1150,20 +1154,31 @@ fn render_instructions(
         };
         return Ok(Some(s.clone()));
     };
-    let mut chain = vec![];
-    let mut current = view.tail;
-    while let Some(key) = current {
-        let node = history.get(key)?;
-        chain.push(node);
-        current = history.parent_key(node);
-    }
     let latest: std::collections::HashMap<_, _> = view
         .latest_versions
         .iter()
         .map(|(k, v)| (k.as_str(), *v))
         .collect();
+    let survivors = match view.tail {
+        Some(tail) => history.survivors(tail, &latest)?,
+        None => Some(vec![]),
+    };
+    let chain = match survivors {
+        Some(nodes) => nodes,
+        None => {
+            let mut chain = vec![];
+            let mut current = view.tail;
+            while let Some(key) = current {
+                let node = history.get(key)?;
+                chain.push(node);
+                current = history.parent_key(node);
+            }
+            chain.reverse();
+            chain
+        }
+    };
     let mut parts = vec![];
-    for node in chain.into_iter().rev() {
+    for node in chain {
         if node
             .replace_key
             .as_deref()

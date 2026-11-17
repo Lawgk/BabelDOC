@@ -1,3 +1,6 @@
+import json
+import re
+
 import pytest
 
 
@@ -58,5 +61,107 @@ def page_words(tmp_path):
             if index >= 0:
                 found[word] = (chars[index].box.x, chars[index].box.y)
         return found
+
+    return run
+
+
+def _last_input_array(prompt: str):
+    """The last JSON array of {id, input} items in a batch prompt, if any."""
+    decoder = json.JSONDecoder()
+    found = None
+    for match in re.finditer(r"\[", prompt):
+        try:
+            value, _ = decoder.raw_decode(prompt, match.start())
+        except ValueError:
+            continue
+        if (
+            isinstance(value, list)
+            and value
+            and all(isinstance(i, dict) and {"id", "input"} <= i.keys() for i in value)
+        ):
+            found = value
+    return found
+
+
+class _EchoTranslator:
+    """Translator stand-in that returns its input; no network, no cache."""
+
+    @staticmethod
+    def build():
+        from babeldoc.translator.translator import BaseTranslator
+
+        class Echo(BaseTranslator):
+            name = "echo"
+
+            def __init__(self):
+                super().__init__("en", "zh", ignore_cache=True)
+                self.model = "echo"
+
+            def do_translate(self, text, rate_limit_params: dict = None):
+                return text
+
+            def do_llm_translate(self, text, rate_limit_params: dict = None):
+                if text is None:  # capability probe
+                    return None
+                batch = _last_input_array(text)
+                if batch is not None:
+                    return json.dumps(
+                        [{"id": i["id"], "output": i["input"]} for i in batch],
+                        ensure_ascii=False,
+                    )
+                # Single-paragraph fallback: the paragraph follows this marker.
+                return text.rsplit("Now translate the following text:\n\n", 1)[-1]
+
+        return Echo()
+
+
+@pytest.fixture
+def translate_pdf(tmp_path):
+    """Run the whole pipeline on raw PDF bytes; return (mono path, stage times)."""
+    import asyncio
+
+    from babeldoc.format.pdf import high_level
+    from babeldoc.format.pdf.translation_config import TranslationConfig
+    from babeldoc.format.pdf.translation_config import WatermarkOutputMode
+
+    high_level.init()
+
+    def run(pdf: bytes, **options):
+        source = tmp_path / "in.pdf"
+        source.write_bytes(pdf)
+        translator = _EchoTranslator.build()
+        config = TranslationConfig(
+            translator,
+            str(source),
+            "en",
+            "zh",
+            None,
+            output_dir=str(tmp_path / "out"),
+            working_dir=str(tmp_path / "work"),
+            no_dual=True,
+            watermark_output_mode=WatermarkOutputMode.NoWatermark,
+            use_rich_pbar=False,
+            **options,
+        )
+        stages: dict[str, float] = {}
+
+        async def drive():
+            import time
+
+            opened = {}
+            async for event in high_level.async_translate(config):
+                now = time.perf_counter()
+                kind = event.get("type")
+                if kind == "progress_start":
+                    opened[event["stage"]] = now
+                elif kind == "progress_end" and event["stage"] in opened:
+                    stages[event["stage"]] = now - opened.pop(event["stage"])
+                elif kind == "finish":
+                    return event["translate_result"]
+                elif kind == "error":
+                    raise RuntimeError(event.get("error"))
+
+        result = asyncio.run(drive())
+        return result.mono_pdf_path, stages
 
     return run
