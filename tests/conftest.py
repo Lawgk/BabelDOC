@@ -4,15 +4,17 @@ import re
 import pytest
 
 
-def build_pdf(content: bytes) -> bytes:
-    """One US-Letter page drawing `content`, with Helvetica (WinAnsi) as /F1."""
+HELVETICA = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+
+
+def build_pdf(content: bytes, font: bytes = HELVETICA) -> bytes:
+    """One US-Letter page drawing `content`, with `font` (Helvetica) as /F1."""
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
         b" /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
-        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica"
-        b" /Encoding /WinAnsiEncoding >>",
+        font,
         b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
     ]
     out = bytearray(b"%PDF-1.7\n")

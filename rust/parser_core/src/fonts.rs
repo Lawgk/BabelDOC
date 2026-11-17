@@ -1150,6 +1150,11 @@ fn populate_simple_tables(
             }
         }
     }
+    let numeric = if out.subtype != "Type3" {
+        numeric_glyph_names(doc, &differences, &unicode, &out.font_name)?
+    } else {
+        None
+    };
     let mut cid = 0i128;
     for item in differences {
         if let Object::Integer(n) = item {
@@ -1164,8 +1169,65 @@ fn populate_simple_tables(
             cid += 1;
         }
     }
+    if let Some(decoded) = numeric {
+        unicode.extend(decoded);
+    }
     out.unicode = Arc::new(unicode);
     Ok(metrics_replaced)
+}
+
+/// Decode Differences that name every glyph /C<n> after its old code.
+///
+/// PDFlib PLOP rewrites of Advent 3B2 journal PDFs renumber each subset
+/// font to codes 1..N, name glyph /C<n> after its code n in the original
+/// font and drop ToUnicode. AGL knows none of these names, so the codes
+/// fall back to the base encoding and decode as (cid:N) or shifted ASCII;
+/// too few to trip the CID checks, the garbage gets translated.
+///
+/// Symbol fonts are named the same way, but their original codes are not
+/// base-encoding characters (/C97 is alpha), and nothing in the font tells
+/// them apart. Fonts named as symbol fonts, fonts with codes the base
+/// encoding lacks, and subsets of one or two glyphs (too small to judge)
+/// keep the old decoding; their CID characters render as original glyphs.
+fn numeric_glyph_names(
+    doc: &Document,
+    differences: &[Object],
+    base: &BTreeMap<u32, String>,
+    font_name: &str,
+) -> Result<Option<BTreeMap<u32, String>>, FontError> {
+    let symbol_font = ["Symbol", "Greek", "Math"]
+        .iter()
+        .any(|word| font_name.contains(word))
+        || font_name
+            .trim_end_matches(|c: char| c.is_ascii_digit())
+            .ends_with("Pi");
+    if symbol_font || differences.is_empty() {
+        return Ok(None);
+    }
+    let mut decoded = BTreeMap::new();
+    let mut cid = 0i128;
+    for item in differences {
+        if let Object::Integer(n) = item {
+            cid = *n as i128;
+            continue;
+        }
+        let glyph = name(doc, Some(item), "")?;
+        let Some(text) = glyph
+            .strip_prefix('C')
+            .filter(|digits| {
+                (1..=3).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+            .and_then(|digits| digits.parse::<u32>().ok())
+            .and_then(|code| base.get(&code))
+        else {
+            return Ok(None);
+        };
+        if let Ok(code) = u32::try_from(cid) {
+            decoded.insert(code, text.clone());
+        }
+        cid += 1;
+    }
+    Ok((decoded.len() > 2).then_some(decoded))
 }
 
 fn stream_length1<'a>(doc: &'a Document, font_file: &'a Object) -> Option<&'a Object> {
