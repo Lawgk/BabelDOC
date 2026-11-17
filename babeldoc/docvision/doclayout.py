@@ -50,6 +50,9 @@ class OnnxModel(DocLayoutModel):
         self._stride = ast.literal_eval(metadata["stride"])
         self._names = ast.literal_eval(metadata["names"])
         providers = []
+        # CoreML needs one static input shape; the CPU provider is faster on
+        # pages padded only up to the stride (no work on padding rows).
+        self._square_input = False
 
         available_providers = onnxruntime.get_available_providers()
         use_coreml = os_name == "Darwin" and any(
@@ -59,6 +62,7 @@ class OnnxModel(DocLayoutModel):
             # Fix input shapes to [1, 3, 1024, 1024] so CoreML can take over
             # 96%+ of the graph nodes (658/681) instead of just 3/823.
             model = self._make_static_model(model, self._FIXED_IMGSZ)
+            self._square_input = True
             providers = [
                 "CoreMLExecutionProvider",
                 "CPUExecutionProvider",
@@ -110,14 +114,15 @@ class OnnxModel(DocLayoutModel):
     def stride(self):
         return self._stride
 
-    def resize_and_pad_image(self, image, new_shape):
+    def resize_and_pad_image(self, image, new_shape, square=False):
         """
-        Resize and pad the image to the specified size, ensuring dimensions are multiples of stride.
+        Resize the image to fit the target size, then pad it.
 
         Parameters:
         - image: Input image
         - new_shape: Target size (integer or (height, width) tuple)
-        - stride: Padding alignment stride, default 32
+        - square: Pad to the full target size instead of the next multiple
+          of the model stride
 
         Returns:
         - Processed image
@@ -139,9 +144,12 @@ class OnnxModel(DocLayoutModel):
             interpolation=cv2.INTER_LINEAR,
         )
 
-        # Pad to full target size (enables static-shape CoreML acceleration)
-        pad_w = new_w - resized_w
-        pad_h = new_h - resized_h
+        if square:
+            pad_w = new_w - resized_w
+            pad_h = new_h - resized_h
+        else:
+            pad_w = -resized_w % self.stride
+            pad_h = -resized_h % self.stride
         top, bottom = pad_h // 2, pad_h - pad_h // 2
         left, right = pad_w // 2, pad_w - pad_w // 2
 
@@ -228,7 +236,9 @@ class OnnxModel(DocLayoutModel):
                 orig_h, orig_w = img.shape[:2]
                 orig_shapes.append((orig_h, orig_w))
 
-                pix = self.resize_and_pad_image(img, new_shape=target_imgsz)
+                pix = self.resize_and_pad_image(
+                    img, new_shape=target_imgsz, square=self._square_input
+                )
                 pix = np.transpose(pix, (2, 0, 1))  # CHW
                 pix = pix.astype(np.float32) / 255.0  # Normalize to [0, 1]
                 processed_batch.append(pix)
