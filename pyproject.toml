@@ -57,6 +57,7 @@ dependencies = [
 directml = ["onnxruntime-directml>=1.16.1"]
 cuda = ["onnxruntime-gpu>=1.16.1"]
 memray = ["memray>=1.17.1"]
+openvino = ["openvino>=2025.0"]
 
 [project.urls]
 Homepage = "https://github.com/funstory-ai/BabelDOC"

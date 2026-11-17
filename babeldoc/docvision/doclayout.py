@@ -11,6 +11,7 @@ import numpy as np
 from babeldoc.docvision.base_doclayout import DocLayoutModel
 from babeldoc.docvision.base_doclayout import YoloResult
 from babeldoc.docvision.inference import layout_threads
+from babeldoc.docvision.inference import openvino_session
 from babeldoc.docvision.inference import ort_session_options
 from babeldoc.format.pdf.document_il.utils.raster_geometry import RasterGeometry
 from babeldoc.format.pdf.document_il.utils.raster_geometry import with_target_long_edge
@@ -49,11 +50,18 @@ class OnnxModel(DocLayoutModel):
         metadata = {d.key: d.value for d in model.metadata_props}
         self._stride = ast.literal_eval(metadata["stride"])
         self._names = ast.literal_eval(metadata["names"])
-        providers = []
+        threads = layout_threads()
+        logger.info(f"Layout model intra-op threads: {threads or 'runtime default'}")
         # CoreML needs one static input shape; the CPU provider is faster on
         # pages padded only up to the stride (no work on padding rows).
         self._square_input = False
+        self.model = openvino_session(model_path, threads)
+        if self.model is None:
+            self.model = self._onnxruntime_session(model, threads)
+        self.lock = threading.Lock()
 
+    def _onnxruntime_session(self, model, threads):
+        providers = []
         available_providers = onnxruntime.get_available_providers()
         use_coreml = os_name == "Darwin" and any(
             re.match(r"coreml", p, re.IGNORECASE) for p in available_providers
@@ -78,14 +86,11 @@ class OnnxModel(DocLayoutModel):
                 if re.match(r"cpu", provider, re.IGNORECASE):
                     logger.info(f"Available Provider: {provider}")
                     providers.append(provider)
-        threads = layout_threads()
-        logger.info(f"Layout model intra-op threads: {threads or 'runtime default'}")
-        self.model = onnxruntime.InferenceSession(
+        return onnxruntime.InferenceSession(
             model.SerializeToString(),
             sess_options=ort_session_options(threads),
             providers=providers,
         )
-        self.lock = threading.Lock()
 
     @staticmethod
     def _make_static_model(model, imgsz):

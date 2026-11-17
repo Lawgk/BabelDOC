@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 from pathlib import Path
 
 import onnxruntime
@@ -12,6 +13,7 @@ import onnxruntime
 logger = logging.getLogger(__name__)
 
 LAYOUT_THREADS_ENV = "BABELDOC_LAYOUT_THREADS"
+LAYOUT_BACKEND_ENV = "BABELDOC_LAYOUT_BACKEND"
 
 
 def _cgroup_v2_limit(root: Path, proc_cgroup: str) -> float | None:
@@ -94,3 +96,59 @@ def ort_session_options(threads: int) -> onnxruntime.SessionOptions:
     if threads:
         options.intra_op_num_threads = threads
     return options
+
+
+class OpenVINOSession:
+    """Runs an ONNX model on OpenVINO's CPU plugin behind onnxruntime's run()."""
+
+    def __init__(self, model_path: str | Path, threads: int):
+        import openvino
+
+        core = openvino.Core()
+        config = {"PERFORMANCE_HINT": "LATENCY"}
+        if threads:
+            config["INFERENCE_NUM_THREADS"] = threads
+        self._compiled = core.compile_model(
+            core.read_model(str(model_path)), "CPU", config
+        )
+        # A compiled model's implicit infer request serves one call at a time.
+        self._lock = threading.Lock()
+
+    def run(self, _output_names, feeds):
+        with self._lock:
+            result = self._compiled(feeds)
+        return [result[output] for output in self._compiled.outputs]
+
+
+def openvino_session(model_path: str | Path, threads: int) -> OpenVINOSession | None:
+    """An OpenVINO session if BABELDOC_LAYOUT_BACKEND=openvino, else None.
+
+    OpenVINO computes in bf16 on CPUs that support it (AVX512_BF16 or AMX),
+    which roughly halves the layout model's time with the same boxes; in f32
+    it is about as fast as onnxruntime. Falls back to onnxruntime (None) when
+    openvino is missing or fails to load the model.
+    """
+    backend = os.environ.get(LAYOUT_BACKEND_ENV, "").strip().lower()
+    if backend in ("", "onnxruntime"):
+        return None
+    if backend != "openvino":
+        logger.warning(
+            "Unknown %s=%r, using onnxruntime", LAYOUT_BACKEND_ENV, backend
+        )
+        return None
+    try:
+        session = OpenVINOSession(model_path, threads)
+    except ImportError:
+        logger.warning(
+            "%s=openvino but openvino is not installed, using onnxruntime",
+            LAYOUT_BACKEND_ENV,
+        )
+        return None
+    except Exception:
+        logger.warning(
+            "OpenVINO failed to load the layout model, using onnxruntime",
+            exc_info=True,
+        )
+        return None
+    logger.info("Layout model runs on OpenVINO")
+    return session
