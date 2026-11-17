@@ -17,6 +17,8 @@ from babeldoc.assets.embedding_assets_metadata import (
 from babeldoc.assets.embedding_assets_metadata import EMBEDDING_FONT_METADATA
 from babeldoc.assets.embedding_assets_metadata import FONT_METADATA_URL
 from babeldoc.assets.embedding_assets_metadata import FONT_URL_BY_UPSTREAM
+from babeldoc.assets.embedding_assets_metadata import PP_DOCLAYOUTV3_ONNX_MODEL_URL
+from babeldoc.assets.embedding_assets_metadata import PP_DOCLAYOUTV3_ONNX_SHA3_256
 from babeldoc.assets.embedding_assets_metadata import TIKTOKEN_CACHES
 from babeldoc.const import get_cache_file_path
 from tenacity import retry
@@ -232,26 +234,50 @@ async def get_fastest_upstream(client: httpx.AsyncClient | None = None):
     return online_font_metadata, fastest_upstream_for_font, fastest_upstream_for_model
 
 
-async def get_doclayout_onnx_model_path_async(client: httpx.AsyncClient | None = None):
-    onnx_path = get_cache_file_path(
-        "doclayout_yolo_docstructbench_imgsz1024.onnx", "models"
-    )
-    if verify_file(onnx_path, DOCLAYOUT_YOLO_DOCSTRUCTBENCH_IMGSZ1024ONNX_SHA3_256):
+async def _get_model_path_async(
+    file_name: str,
+    sha3_256: str,
+    urls: dict[str, str],
+    client: httpx.AsyncClient | None = None,
+):
+    onnx_path = get_cache_file_path(file_name, "models")
+    if verify_file(onnx_path, sha3_256):
         return onnx_path
 
-    logger.info("doclayout onnx model not found or corrupted, downloading...")
+    logger.info(f"{file_name} not found or corrupted, downloading...")
     fastest_upstream, _ = await get_fastest_upstream_for_model(client)
     if fastest_upstream is None:
         logger.error("Failed to get fastest upstream")
         exit(1)
 
-    url = DOC_LAYOUT_ONNX_MODEL_URL[fastest_upstream]
+    url = urls[fastest_upstream]
 
-    await download_file(
-        client, url, onnx_path, DOCLAYOUT_YOLO_DOCSTRUCTBENCH_IMGSZ1024ONNX_SHA3_256
-    )
-    logger.info(f"Download doclayout onnx model from {fastest_upstream} success")
+    await download_file(client, url, onnx_path, sha3_256)
+    logger.info(f"Download {file_name} from {fastest_upstream} success")
     return onnx_path
+
+
+async def get_doclayout_onnx_model_path_async(client: httpx.AsyncClient | None = None):
+    return await _get_model_path_async(
+        "doclayout_yolo_docstructbench_imgsz1024.onnx",
+        DOCLAYOUT_YOLO_DOCSTRUCTBENCH_IMGSZ1024ONNX_SHA3_256,
+        DOC_LAYOUT_ONNX_MODEL_URL,
+        client,
+    )
+
+
+PP_DOCLAYOUTV3_ONNX_FILE_NAME = "pp_doclayoutv3.onnx"
+
+
+async def get_pp_doclayoutv3_onnx_model_path_async(
+    client: httpx.AsyncClient | None = None,
+):
+    return await _get_model_path_async(
+        PP_DOCLAYOUTV3_ONNX_FILE_NAME,
+        PP_DOCLAYOUTV3_ONNX_SHA3_256,
+        PP_DOCLAYOUTV3_ONNX_MODEL_URL,
+        client,
+    )
 
 
 async def get_table_detection_rapidocr_model_path_async(
@@ -265,6 +291,17 @@ async def get_table_detection_rapidocr_model_path_async(
 
 def get_doclayout_onnx_model_path():
     return run_coro(get_doclayout_onnx_model_path_async())
+
+
+def get_pp_doclayoutv3_onnx_model_path():
+    return run_coro(get_pp_doclayoutv3_onnx_model_path_async())
+
+
+def _pp_doclayoutv3_selected() -> bool:
+    # Fetched (and packed offline) only when selected: it is 130 MB.
+    from babeldoc.docvision.inference import layout_model_name
+
+    return layout_model_name() == "pp-doclayoutv3"
 
 
 def get_table_detection_rapidocr_model_path():
@@ -455,7 +492,12 @@ async def async_warmup():
         onnx_task = asyncio.create_task(get_doclayout_onnx_model_path_async(client))
         font_tasks = asyncio.create_task(download_all_fonts_async(client))
         cmap_tasks = asyncio.create_task(download_all_cmaps_async(client))
-        await asyncio.gather(onnx_task, font_tasks, cmap_tasks)
+        tasks = [onnx_task, font_tasks, cmap_tasks]
+        if _pp_doclayoutv3_selected():
+            tasks.append(
+                asyncio.create_task(get_pp_doclayoutv3_onnx_model_path_async(client))
+            )
+        await asyncio.gather(*tasks)
 
 
 def warmup():
@@ -495,6 +537,13 @@ def generate_all_assets_file_list():
             "sha3_256": DOCLAYOUT_YOLO_DOCSTRUCTBENCH_IMGSZ1024ONNX_SHA3_256,
         },
     )
+    if _pp_doclayoutv3_selected():
+        result["models"].append(
+            {
+                "name": PP_DOCLAYOUTV3_ONNX_FILE_NAME,
+                "sha3_256": PP_DOCLAYOUTV3_ONNX_SHA3_256,
+            },
+        )
     return result
 
 

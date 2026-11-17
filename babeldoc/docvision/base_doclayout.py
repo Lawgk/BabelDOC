@@ -40,6 +40,13 @@ class YoloBox:
 class DocLayoutModel(abc.ABC):
     @staticmethod
     def load_onnx():
+        from babeldoc.docvision.inference import layout_model_name
+
+        if layout_model_name() == "pp-doclayoutv3":
+            logger.info("Loading PP-DocLayoutV3 ONNX model...")
+            from babeldoc.docvision.pp_doclayout import PPDocLayoutV3Model
+
+            return PPDocLayoutV3Model.from_pretrained()
         logger.info("Loading ONNX model...")
         from babeldoc.docvision.doclayout import OnnxModel
 

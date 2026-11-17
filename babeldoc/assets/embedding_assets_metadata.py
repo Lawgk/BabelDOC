@@ -4,6 +4,10 @@ DOCLAYOUT_YOLO_DOCSTRUCTBENCH_IMGSZ1024ONNX_SHA3_256 = (
     "60be061226930524958b5465c8c04af3d7c03bcb0beb66454f5da9f792e3cf2a"
 )
 
+PP_DOCLAYOUTV3_ONNX_SHA3_256 = (
+    "13b9c18cb887517c28008ebae78dd734dfb73b3243d50b7055bad6c945e25c48"
+)
+
 TIKTOKEN_CACHES = {
     "fb374d419588a4632f3f557e76b4b70aebbca790": "cb04bcda5782cfbbe77f2f991d92c0ea785d9496ef1137c91dfc3c8c324528d6"
 }
@@ -33,6 +37,13 @@ DOC_LAYOUT_ONNX_MODEL_URL = {
     "huggingface": "https://huggingface.co/wybxc/DocLayout-YOLO-DocStructBench-onnx/resolve/main/doclayout_yolo_docstructbench_imgsz1024.onnx?download=true",
     "hf-mirror": "https://hf-mirror.com/wybxc/DocLayout-YOLO-DocStructBench-onnx/resolve/main/doclayout_yolo_docstructbench_imgsz1024.onnx?download=true",
     "modelscope": "https://www.modelscope.cn/models/AI-ModelScope/DocLayout-YOLO-DocStructBench-onnx/resolve/master/doclayout_yolo_docstructbench_imgsz1024.onnx",
+}
+
+# PaddlePaddle/PP-DocLayoutV3_onnx, pinned to the revisions that were evaluated.
+PP_DOCLAYOUTV3_ONNX_MODEL_URL = {
+    "huggingface": "https://huggingface.co/PaddlePaddle/PP-DocLayoutV3_onnx/resolve/46bbdf188bb0a772c08aed74882ce7e51a8f1ea6/inference.onnx?download=true",
+    "hf-mirror": "https://hf-mirror.com/PaddlePaddle/PP-DocLayoutV3_onnx/resolve/46bbdf188bb0a772c08aed74882ce7e51a8f1ea6/inference.onnx?download=true",
+    "modelscope": "https://www.modelscope.cn/models/PaddlePaddle/PP-DocLayoutV3_onnx/resolve/afe9e948f9492ae88399f7b6f734a784fc1a80c6/inference.onnx",
 }
 
 # from https://github.com/funstory-ai/BabelDOC-Assets/blob/main/font_metadata.json

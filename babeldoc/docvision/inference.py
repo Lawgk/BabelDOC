@@ -14,6 +14,21 @@ logger = logging.getLogger(__name__)
 
 LAYOUT_THREADS_ENV = "BABELDOC_LAYOUT_THREADS"
 LAYOUT_BACKEND_ENV = "BABELDOC_LAYOUT_BACKEND"
+LAYOUT_MODEL_ENV = "BABELDOC_LAYOUT_MODEL"
+LAYOUT_MODELS = ("doclayout-yolo", "pp-doclayoutv3")
+
+
+def layout_model_name() -> str:
+    """The layout model BABELDOC_LAYOUT_MODEL selects, DocLayout-YOLO by default."""
+    name = os.environ.get(LAYOUT_MODEL_ENV, "").strip().lower()
+    if not name:
+        return LAYOUT_MODELS[0]
+    if name not in LAYOUT_MODELS:
+        logger.warning(
+            "Unknown %s=%r, using %s", LAYOUT_MODEL_ENV, name, LAYOUT_MODELS[0]
+        )
+        return LAYOUT_MODELS[0]
+    return name
 
 
 def _cgroup_v2_limit(root: Path, proc_cgroup: str) -> float | None:
