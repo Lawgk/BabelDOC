@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 
 import pymupdf
 import pytest
@@ -69,4 +70,79 @@ def test_a_failing_part_releases_the_part_prepared_ahead(
         translate_pdf(_book(), split_strategy=_split(2))
     # Part 0 failed; part 1, prepared ahead of it, was closed too.
     assert set(closed) == {0, 1}
+    assert not _prefetch_threads()
+
+
+PROGRESS_EVENTS = ("progress_start", "progress_update", "progress_end")
+
+
+@pytest.mark.parametrize("late", [False, True], ids=["prepared-early", "prepared-late"])
+def test_overall_progress_never_goes_back(translate_pdf, monkeypatch, late):
+    # pdf2zh reports overall_progress to the user as the task's percentage.
+    from babeldoc.format.pdf import high_level
+
+    if late:
+        written = [threading.Event() for _ in range(PAGES)]
+        prepare, finish = high_level._prepare_part, high_level._finish_single
+
+        def late_prepare(pm, config, doc, split_points, i, run_context):
+            # Hold part i back until part i-1 is written: all of its preparation
+            # then reports while it is already the current part.
+            if i > 0:
+                assert written[i - 1].wait(60)
+            return prepare(pm, config, doc, split_points, i, run_context)
+
+        def marking_finish(prepared, run_context):
+            try:
+                return finish(prepared, run_context)
+            finally:
+                written[prepared.config._capture_part_index].set()
+
+        monkeypatch.setattr(high_level, "_prepare_part", late_prepare)
+        monkeypatch.setattr(high_level, "_finish_single", marking_finish)
+
+    translate_pdf(_book(), split_strategy=_split(2))
+    progress = [
+        e["overall_progress"] for e in translate_pdf.events if e["type"] in PROGRESS_EVENTS
+    ]
+    assert {e.get("part_index") for e in translate_pdf.events} >= {1, 2, 3}
+    assert progress == sorted(progress)
+    assert progress[-1] <= 100
+
+
+def test_cancelling_releases_the_part_prepared_ahead(translate_pdf, monkeypatch):
+    from babeldoc.format.pdf import high_level
+
+    prepared = []
+    prepare, finish = high_level._prepare_single, high_level._finish_single
+
+    def tracking_prepare(*args, **kwargs):
+        part = prepare(*args, **kwargs)
+        prepared.append(part)
+        return part
+
+    def finish_once_next_is_ready(part, run_context):
+        # Translate part 0 only once part 1 is prepared, so the cancellation
+        # below finds a whole part waiting in the background.
+        deadline = time.monotonic() + 60
+        while len(prepared) < 2 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return finish(part, run_context)
+
+    def cancel_when_translating(event, config):
+        # pdf2zh cancels this way, from its own thread, when the user cancels.
+        if event["type"] == "progress_start" and event["stage"] == "Translate Paragraphs":
+            config.cancel_translation()
+
+    monkeypatch.setattr(high_level, "_prepare_single", tracking_prepare)
+    monkeypatch.setattr(high_level, "_finish_single", finish_once_next_is_ready)
+    started = time.monotonic()
+    with pytest.raises(Exception, match="Cancel"):
+        translate_pdf(_book(), split_strategy=_split(2), on_event=cancel_when_translating)
+    assert time.monotonic() - started < 60
+    assert not any(e["type"] == "finish" for e in translate_pdf.events)
+    assert len(prepared) == 2
+    for part in prepared:
+        assert part.run is None
+        assert part.doc_pdf2zh.is_closed
     assert not _prefetch_threads()

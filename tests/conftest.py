@@ -7,10 +7,13 @@ import pytest
 HELVETICA = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
 
 
-def build_pdf(content: bytes, font: bytes = HELVETICA, extra_fonts=None) -> bytes:
+def build_pdf(
+    content: bytes, font: bytes = HELVETICA, extra_fonts=None, resources: bytes = b""
+) -> bytes:
     """One US-Letter page drawing `content`, with `font` (Helvetica) as /F1.
 
-    `extra_fonts` maps further resource names (b"F2") to font dictionaries.
+    `extra_fonts` maps further resource names (b"F2") to font dictionaries;
+    `resources` is appended to the page's resource dictionary as is.
     """
     extra_fonts = extra_fonts or {}
     names = b"".join(
@@ -20,7 +23,7 @@ def build_pdf(content: bytes, font: bytes = HELVETICA, extra_fonts=None) -> byte
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
-        b" /Resources << /Font << /F1 4 0 R%s >> >> /Contents 5 0 R >>" % names,
+        b" /Resources << /Font << /F1 4 0 R%s >>%s >> /Contents 5 0 R >>" % (names, resources),
         font,
         b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
         *extra_fonts.values(),
@@ -134,7 +137,9 @@ class _EchoTranslator:
 def translate_pdf(tmp_path):
     """Run the whole pipeline on raw PDF bytes; return (mono path, stage times).
 
-    The texts sent for translation are left in `translate_pdf.inputs`.
+    The texts sent for translation are left in `translate_pdf.inputs`, every
+    event in `translate_pdf.events`. `on_event(event, config)` is called for
+    each event as it arrives.
     """
     import asyncio
 
@@ -144,7 +149,7 @@ def translate_pdf(tmp_path):
 
     high_level.init()
 
-    def run(pdf: bytes, **options):
+    def run(pdf: bytes, on_event=None, **options):
         source = tmp_path / "in.pdf"
         source.write_bytes(pdf)
         translator = _EchoTranslator.build()
@@ -163,6 +168,7 @@ def translate_pdf(tmp_path):
             **options,
         )
         stages: dict[str, float] = {}
+        run.events = []
 
         async def drive():
             import time
@@ -170,6 +176,9 @@ def translate_pdf(tmp_path):
             opened = {}
             async for event in high_level.async_translate(config):
                 now = time.perf_counter()
+                run.events.append(event)
+                if on_event is not None:
+                    on_event(event, config)
                 kind = event.get("type")
                 if kind == "progress_start":
                     opened[event["stage"]] = now
@@ -184,4 +193,5 @@ def translate_pdf(tmp_path):
         return result.mono_pdf_path, stages
 
     run.inputs = []
+    run.events = []
     return run
