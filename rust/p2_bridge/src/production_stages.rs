@@ -219,7 +219,9 @@ pub fn typesetting(
     cancellation: &CancelFlag,
 ) -> PyResult<()> {
     let fields = field(config, "config_fields").unwrap_or(config);
-    let total = {
+    // The stage reports every page twice, once measuring and once rendering it;
+    // the reporter ignores the total the stage passes along with each report.
+    let total = 2 * {
         let view = document.view::<babeldoc_ir_core::ReadOnlyView>();
         view.document()
             .page_len(&view)
