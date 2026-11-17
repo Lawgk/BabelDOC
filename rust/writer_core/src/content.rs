@@ -283,11 +283,20 @@ fn units(v: &View<'_>, p: &Cursor<types::Page>, o: &BuildOptions) -> Result<Vec<
     for (i, rectangle) in p.pdf_rectangle_iter(v)?.enumerate() {
         let r = rectangle?;
         let debug = r.debug_info(v)?.unwrap_or(false);
-        if (o.ocr_workaround && !debug && r.fill_background(v)?.unwrap_or(false))
-            || (o.debug && debug)
-        {
+        let ocr_cover = o.ocr_workaround && !debug && r.fill_background(v)?.unwrap_or(false);
+        if ocr_cover || (o.debug && debug) {
             units.push(Ordered {
-                order: r.render_order(v)?.unwrap_or(LAST),
+                // OCR mode clears every char's render order. Sharing that
+                // unordered key would leave covers and text to unrelated sub
+                // orders (position in a paragraph vs index among rectangles),
+                // putting short untranslated runs such as table cells and page
+                // numbers under a later cover. Covers go after all ordered
+                // content (the scan, paths) and before any text.
+                order: if ocr_cover {
+                    LAST - 1
+                } else {
+                    r.render_order(v)?.unwrap_or(LAST)
+                },
                 sub: i as i64,
                 scope: r.xobj_id(v)?,
                 unit: Unit::Rectangle(r, if o.ocr_workaround { 0.1 } else { 0.4 }),
