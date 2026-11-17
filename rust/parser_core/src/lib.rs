@@ -642,6 +642,7 @@ struct Parser {
     xobject_paths: Vec<Vec<String>>,
     end_operations: HashMap<Vec<String>, String>,
     valid_text: Vec<Vec<String>>,
+    warned_text_outside_text_object: bool,
 }
 pub struct Parsed {
     pub document: ir::Document,
@@ -780,6 +781,7 @@ fn parse_loaded_with_diagnostics(
         xobject_paths: vec![],
         end_operations: HashMap::new(),
         valid_text: vec![],
+        warned_text_outside_text_object: false,
     };
     let result = p.run(observer);
     #[cfg(test)]
@@ -1104,11 +1106,18 @@ impl Parser {
                     state.line = [0.; 2]
                 }
                 "Tj" | "TJ" | "'" | "\"" => {
-                    if !state.in_text {
-                        return Err(Error::new(
-                            "ValueError",
-                            format!("{op} used outside a text object."),
-                        ));
+                    // The spec forbids text-showing outside BT/ET, but real files do it
+                    // (IOPscience cover pages leave the journal line and URL after the
+                    // closing ET, positioned by a bare Tm) and every viewer draws it.
+                    // Show it as an implicit text object: the current text and line
+                    // matrices stay, so a stray Tm still positions it and consecutive
+                    // stray runs still advance; a real BT afterwards resets as usual.
+                    if !state.in_text && !self.warned_text_outside_text_object {
+                        self.warned_text_outside_text_object = true;
+                        log::warn!(
+                            target: "babeldoc.parser",
+                            "{op} used outside a text object; treating it as an implicit BT/ET"
+                        );
                     }
                     if op == "'" || op == "\"" {
                         if op == "\"" {
