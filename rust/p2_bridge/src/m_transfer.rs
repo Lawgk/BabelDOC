@@ -587,6 +587,7 @@ impl MDocument {
         result
     }
 
+    /// Run every stage of a part: `prepare_part`, then `finish_part`.
     #[pyo3(signature=(run_context, config, executors, stage_config_json, paths_json, writer_config_json, writer_assets_json, flag, monitor, capture_stages, capture_paths_json))]
     fn run_part(
         &mut self,
@@ -603,6 +604,151 @@ impl MDocument {
         capture_stages: bool,
         capture_paths_json: &str,
     ) -> PyResult<(Option<String>, Option<String>, Option<String>)> {
+        let handles = RunHandles::new(py, &run_context);
+        drop(run_context);
+        self.prepare_stages(
+            py,
+            handles.clone_ref(py),
+            config,
+            executors,
+            stage_config_json,
+            paths_json,
+            flag.clone(),
+            monitor.clone_ref(py),
+            capture_stages,
+            capture_paths_json,
+        )?;
+        self.finish_stages(
+            py,
+            handles,
+            config,
+            executors,
+            stage_config_json,
+            paths_json,
+            writer_config_json,
+            writer_assets_json,
+            flag,
+            monitor,
+            capture_stages,
+            capture_paths_json,
+        )
+    }
+
+    /// The stages before translation: scanned-file check, layout, paragraphs,
+    /// styles and formulas. They are CPU-bound while translation mostly waits
+    /// on the translator, so a split document prepares its next part here
+    /// while the current one is in `finish_part`.
+    #[pyo3(signature=(run_context, config, executors, stage_config_json, paths_json, flag, monitor, capture_stages, capture_paths_json))]
+    fn prepare_part(
+        &mut self,
+        py: Python<'_>,
+        run_context: PyRef<'_, crate::run_context::DocumentRunContext>,
+        config: &Bound<'_, PyAny>,
+        executors: &Bound<'_, PyDict>,
+        stage_config_json: &str,
+        paths_json: &str,
+        flag: CancelFlag,
+        monitor: Py<PyAny>,
+        capture_stages: bool,
+        capture_paths_json: &str,
+    ) -> PyResult<()> {
+        let handles = RunHandles::new(py, &run_context);
+        drop(run_context);
+        self.prepare_stages(
+            py,
+            handles,
+            config,
+            executors,
+            stage_config_json,
+            paths_json,
+            flag,
+            monitor,
+            capture_stages,
+            capture_paths_json,
+        )
+    }
+
+    /// Term extraction, translation, typesetting and PDF output for a part
+    /// whose `prepare_part` has run.
+    #[pyo3(signature=(run_context, config, executors, stage_config_json, paths_json, writer_config_json, writer_assets_json, flag, monitor, capture_stages, capture_paths_json))]
+    fn finish_part(
+        &mut self,
+        py: Python<'_>,
+        run_context: PyRef<'_, crate::run_context::DocumentRunContext>,
+        config: &Bound<'_, PyAny>,
+        executors: &Bound<'_, PyDict>,
+        stage_config_json: &str,
+        paths_json: &str,
+        writer_config_json: &str,
+        writer_assets_json: &str,
+        flag: CancelFlag,
+        monitor: Py<PyAny>,
+        capture_stages: bool,
+        capture_paths_json: &str,
+    ) -> PyResult<(Option<String>, Option<String>, Option<String>)> {
+        let handles = RunHandles::new(py, &run_context);
+        drop(run_context);
+        self.finish_stages(
+            py,
+            handles,
+            config,
+            executors,
+            stage_config_json,
+            paths_json,
+            writer_config_json,
+            writer_assets_json,
+            flag,
+            monitor,
+            capture_stages,
+            capture_paths_json,
+        )
+    }
+}
+
+/// The run context's handles, cloned so no borrow of it is held while the
+/// stages call back into Python.
+struct RunHandles {
+    shared_context: Py<PyAny>,
+    font_mapper: Py<PyAny>,
+    dispatcher_a: Py<PyAny>,
+    dispatcher_b: Py<PyAny>,
+}
+
+impl RunHandles {
+    fn new(py: Python<'_>, context: &crate::run_context::DocumentRunContext) -> Self {
+        Self {
+            shared_context: context.shared_context.clone_ref(py),
+            font_mapper: context.font_mapper.clone_ref(py),
+            dispatcher_a: context.dispatcher_a.clone_ref(py),
+            dispatcher_b: context.dispatcher_b.clone_ref(py),
+        }
+    }
+
+    fn clone_ref(&self, py: Python<'_>) -> Self {
+        Self {
+            shared_context: self.shared_context.clone_ref(py),
+            font_mapper: self.font_mapper.clone_ref(py),
+            dispatcher_a: self.dispatcher_a.clone_ref(py),
+            dispatcher_b: self.dispatcher_b.clone_ref(py),
+        }
+    }
+}
+
+impl MDocument {
+    #[allow(clippy::too_many_arguments)]
+    fn prepare_stages(
+        &mut self,
+        py: Python<'_>,
+        handles: RunHandles,
+        config: &Bound<'_, PyAny>,
+        executors: &Bound<'_, PyDict>,
+        stage_config_json: &str,
+        paths_json: &str,
+        flag: CancelFlag,
+        monitor: Py<PyAny>,
+        capture_stages: bool,
+        capture_paths_json: &str,
+    ) -> PyResult<()> {
         #[cfg(not(feature = "stage-capture"))]
         if capture_stages {
             return Err(PyRuntimeError::new_err(
@@ -627,17 +773,11 @@ impl MDocument {
         } else {
             serde_json::Value::Null
         };
-        let mut writer_cfg: crate::writer::WriteConfig =
-            serde_json::from_str(writer_config_json)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        writer_cfg.keep_pages = writer_keep_pages(&mut self.document, config)?;
-        let writer_assets: Vec<crate::writer::AssetSpec> = serde_json::from_str(writer_assets_json)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let shared_context = run_context.shared_context.clone_ref(py);
-        let font_mapper = run_context.font_mapper.clone_ref(py);
-        let dispatcher_a = run_context.dispatcher_a.clone_ref(py);
-        let dispatcher_b = run_context.dispatcher_b.clone_ref(py);
-        drop(run_context);
+        let RunHandles {
+            shared_context,
+            font_mapper,
+            ..
+        } = handles;
         let mapper = font_mapper
             .bind(py)
             .extract::<PyRef<'_, crate::font_mapper::FontMapperHandle>>()?;
@@ -655,17 +795,7 @@ impl MDocument {
             .getattr("only_parse_generate_pdf")?
             .extract::<bool>()?
         {
-            return write_part(
-                py,
-                &mut self.document,
-                &self.page_objects,
-                writer_cfg,
-                writer_assets,
-                &mapper,
-                executor("writer")?,
-                flag,
-                monitor,
-            );
+            return Ok(());
         }
         if !config
             .getattr("skip_scanned_detection")?
@@ -691,7 +821,6 @@ impl MDocument {
             stages["styles"]["config_fields"]["ocr_workaround"] = ocr_workaround.into();
             stages["styles"]["config_fields"]["remove_non_formula_lines"] =
                 remove_non_formula_lines.into();
-            writer_cfg.ocr_workaround = ocr_workaround;
         }
         #[cfg(feature = "stage-capture")]
         if capture_stages {
@@ -768,6 +897,85 @@ impl MDocument {
         #[cfg(feature = "stage-capture")]
         if capture_stages {
             capture_at(&self.document, &capture_paths, "styles")?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_stages(
+        &mut self,
+        py: Python<'_>,
+        handles: RunHandles,
+        config: &Bound<'_, PyAny>,
+        executors: &Bound<'_, PyDict>,
+        stage_config_json: &str,
+        paths_json: &str,
+        writer_config_json: &str,
+        writer_assets_json: &str,
+        flag: CancelFlag,
+        monitor: Py<PyAny>,
+        capture_stages: bool,
+        capture_paths_json: &str,
+    ) -> PyResult<(Option<String>, Option<String>, Option<String>)> {
+        #[cfg(not(feature = "stage-capture"))]
+        if capture_stages {
+            return Err(PyRuntimeError::new_err(
+                "stage capture was requested, but this Rust extension was built without the `stage-capture` Cargo feature",
+            ));
+        }
+        #[cfg(not(feature = "stage-capture"))]
+        let _ = capture_paths_json;
+        let stages: serde_json::Value = serde_json::from_str(stage_config_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let paths: serde_json::Value = serde_json::from_str(paths_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        #[cfg(feature = "stage-capture")]
+        let capture_paths: serde_json::Value = if capture_stages {
+            serde_json::from_str(capture_paths_json)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?
+        } else {
+            serde_json::Value::Null
+        };
+        let mut writer_cfg: crate::writer::WriteConfig =
+            serde_json::from_str(writer_config_json)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        writer_cfg.keep_pages = writer_keep_pages(&mut self.document, config)?;
+        let writer_assets: Vec<crate::writer::AssetSpec> = serde_json::from_str(writer_assets_json)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        let RunHandles {
+            shared_context,
+            font_mapper,
+            dispatcher_a,
+            dispatcher_b,
+        } = handles;
+        let mapper = font_mapper
+            .bind(py)
+            .extract::<PyRef<'_, crate::font_mapper::FontMapperHandle>>()?;
+        let mapper = crate::font_mapper::FontMapperHandle::from_shared(std::sync::Arc::clone(
+            &mapper.mapper,
+        ));
+        let executor = |name: &str| -> PyResult<Py<PyAny>> {
+            executors
+                .get_item(name)?
+                .ok_or_else(|| PyValueError::new_err(format!("missing {name} callback executor")))
+                .map(Bound::unbind)
+        };
+        let debug = config.getattr("debug")?.extract::<bool>()?;
+        if config
+            .getattr("only_parse_generate_pdf")?
+            .extract::<bool>()?
+        {
+            return write_part(
+                py,
+                &mut self.document,
+                &self.page_objects,
+                writer_cfg,
+                writer_assets,
+                &mapper,
+                executor("writer")?,
+                flag,
+                monitor,
+            );
         }
         // The 0.6.4 probe happens after styles and before term extraction. Keep
         // it as a Python callback so caller supplied translator objects retain

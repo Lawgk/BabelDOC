@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import dataclasses
 import hashlib
 import json
 import logging
@@ -8,7 +9,10 @@ import shutil
 import threading
 import time
 from asyncio import CancelledError
+from concurrent.futures import Future
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from typing import Any
 
 import pymupdf
 from pymupdf import Document
@@ -28,6 +32,7 @@ from babeldoc.format.pdf.document_il.backend.pdf_creater import reproduce_cmap
 from babeldoc.format.pdf.document_il.utils.fontmap import FontMapper
 from babeldoc.format.pdf.result_merger import ResultMerger
 from babeldoc.format.pdf.split_manager import SplitManager
+from babeldoc.format.pdf.split_manager import SplitPoint
 from babeldoc.format.pdf.translation_config import TranslateResult
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
@@ -659,112 +664,82 @@ def do_translate(
                     else:
                         pm.total_parts = len(split_points)
 
-                        # Process parts serially
                         results: dict[int, TranslateResult | None] = {}
                         original_watermark_mode = (
                             translation_config.watermark_output_mode
                         )
                         original_doc = Document(original_pdf_path)
-                        for i, split_point in enumerate(split_points):
-                            try:
-                                # Create a copy of config for this part
-                                part_config = copy.copy(translation_config)
-                                part_config._capture_part_index = i
-                                part_config.skip_clean = True
-                                should_translate_pages = []
-                                for page in range(
-                                    split_point.start_page, split_point.end_page + 1
-                                ):
-                                    if translation_config.should_translate_page(
-                                        page + 1
-                                    ):
-                                        should_translate_pages.append(
-                                            page - split_point.start_page + 1
+                        # Parsing and layout are CPU-bound while translation mostly
+                        # waits on the translator, so part i+1 is prepared in the
+                        # background while part i is translated. Never more than one
+                        # part ahead, to bound memory.
+                        prefetch = ThreadPoolExecutor(
+                            max_workers=1, thread_name_prefix="babeldoc-part-prefetch"
+                        )
+                        next_part: Future | None = None
+                        try:
+                            for i in range(len(split_points)):
+                                try:
+                                    pm.reporting_part_index = i
+                                    if next_part is None:
+                                        prepared_part = _prepare_part(
+                                            pm,
+                                            translation_config,
+                                            original_doc,
+                                            split_points,
+                                            i,
+                                            run_context,
                                         )
-                                part_config.pages = None
-                                part_config.page_ranges = [
-                                    (x, x) for x in should_translate_pages
-                                ]
-                                if (
-                                    translation_config.only_include_translated_page
-                                    and not should_translate_pages
-                                ):
-                                    results[i] = None
-                                    continue
-
-                                # Only first part should do scanned detection if enabled
-                                if i > 0:
-                                    part_config.skip_scanned_detection = True
-
-                                part_config.working_dir = (
-                                    translation_config.get_part_working_dir(i)
-                                )
-                                part_config.output_dir = (
-                                    translation_config.get_part_output_dir(i)
-                                )
-
-                                assert id(
-                                    part_config.shared_context_cross_split_part
-                                ) == id(
-                                    translation_config.shared_context_cross_split_part
-                                ), "shared_context_cross_split_part must be the same"
-
-                                part_temp_input_path = (
-                                    part_config.get_working_file_path(
-                                        f"input.part{i}.pdf"
-                                    )
-                                )
-                                part_config.input_file = part_temp_input_path
-
-                                temp_doc = Document()
-                                for x in range(
-                                    split_point.start_page, split_point.end_page + 1
-                                ):
-                                    xref = original_doc[x].xref
-                                    if (
-                                        original_doc.xref_get_key(xref, "Annots")[0]
-                                        != "null"
-                                    ):
-                                        original_doc.xref_set_key(
-                                            xref, "Annots", "null"
+                                    else:
+                                        wait_start = time.time()
+                                        prepared_part = next_part.result()
+                                        next_part = None
+                                        logger.info(
+                                            f"part {i} was prepared ahead, "
+                                            f"waited {time.time() - wait_start:.1f}s for it"
                                         )
-                                temp_doc.insert_pdf(
-                                    original_doc,
-                                    from_page=split_point.start_page,
-                                    to_page=split_point.end_page,
-                                )
-                                safe_save(temp_doc, part_temp_input_path)
-                                assert (
-                                    temp_doc.page_count
-                                    == split_point.end_page - split_point.start_page + 1
-                                )
-
-                                # Only first part should have watermark
-                                if i > 0:
-                                    part_config.watermark_output_mode = (
-                                        WatermarkOutputMode.NoWatermark
+                                    if i + 1 < len(split_points):
+                                        next_part = prefetch.submit(
+                                            _prepare_part,
+                                            pm,
+                                            translation_config,
+                                            original_doc,
+                                            split_points,
+                                            i + 1,
+                                            run_context,
+                                        )
+                                    results[i] = (
+                                        None
+                                        if prepared_part is None
+                                        else _finish_single(prepared_part, run_context)
                                     )
-
-                                # Create progress monitor for this part
-                                part_monitor = pm.create_part_monitor(
-                                    i, len(split_points)
-                                )
-
-                                # Process this part
-                                result = _do_translate_single(
-                                    part_monitor,
-                                    part_config,
-                                    run_context,
-                                )
-                                results[i] = result
-
-                            except Exception as e:
-                                logger.error(f"Error in part {i}: {e}")
-                                pm.translate_error(e)
-                                raise
-                            finally:
-                                # Clean up part working directory
-                                translation_config.cleanup_part_working_dir(i)
+                                    # Release this part's IR before waiting for the next one
+                                    prepared_part = None
+                                except Exception as e:
+                                    logger.error(f"Error in part {i}: {e}")
+                                    pm.translate_error(e)
+                                    raise
+                                finally:
+                                    # Clean up part working directory
+                                    translation_config.cleanup_part_working_dir(i)
+                        finally:
+                            if (
+                                next_part is not None
+                                and not next_part.done()
+                                and pm.cancel_event is not None
+                            ):
+                                # Only on failure: stop the part being prepared before
+                                # its working directory is removed.
+                                pm.cancel_event.set()
+                            prefetch.shutdown(wait=True)
+                            if (
+                                next_part is not None
+                                and next_part.exception() is None
+                                and next_part.result() is not None
+                            ):
+                                # Prepared ahead of a failure: it still holds its
+                                # callback run and its input PDF.
+                                next_part.result().close()
 
                         # Restore original watermark mode
                         translation_config.watermark_output_mode = (
@@ -1055,12 +1030,138 @@ def _rust_writer_inputs(config, run_context, temp_pdf_path):
     return writer_config, writer_assets, paths
 
 
+def _prepare_part(
+    pm: ProgressMonitor,
+    translation_config: TranslationConfig,
+    original_doc: Document,
+    split_points: list[SplitPoint],
+    i: int,
+    run_context,
+) -> "_PreparedPart | None":
+    """Cut part i out of the original PDF and run the stages before translation.
+
+    Returns None when the part has no page to translate and untranslated pages
+    are dropped, or when nothing of it is left to translate.
+    """
+    start_time = time.time()
+    split_point = split_points[i]
+    # Create a copy of config for this part
+    part_config = copy.copy(translation_config)
+    part_config._capture_part_index = i
+    part_config.skip_clean = True
+    should_translate_pages = []
+    for page in range(split_point.start_page, split_point.end_page + 1):
+        if translation_config.should_translate_page(page + 1):
+            should_translate_pages.append(page - split_point.start_page + 1)
+    part_config.pages = None
+    part_config.page_ranges = [(x, x) for x in should_translate_pages]
+    if translation_config.only_include_translated_page and not should_translate_pages:
+        return None
+
+    # Only first part should do scanned detection if enabled
+    if i > 0:
+        part_config.skip_scanned_detection = True
+
+    part_config.working_dir = translation_config.get_part_working_dir(i)
+    part_config.output_dir = translation_config.get_part_output_dir(i)
+
+    assert id(part_config.shared_context_cross_split_part) == id(
+        translation_config.shared_context_cross_split_part
+    ), "shared_context_cross_split_part must be the same"
+
+    part_temp_input_path = part_config.get_working_file_path(f"input.part{i}.pdf")
+    part_config.input_file = part_temp_input_path
+
+    temp_doc = Document()
+    for x in range(split_point.start_page, split_point.end_page + 1):
+        xref = original_doc[x].xref
+        if original_doc.xref_get_key(xref, "Annots")[0] != "null":
+            original_doc.xref_set_key(xref, "Annots", "null")
+    temp_doc.insert_pdf(
+        original_doc,
+        from_page=split_point.start_page,
+        to_page=split_point.end_page,
+    )
+    safe_save(temp_doc, part_temp_input_path)
+    assert temp_doc.page_count == split_point.end_page - split_point.start_page + 1
+
+    # Only first part should have watermark
+    if i > 0:
+        part_config.watermark_output_mode = WatermarkOutputMode.NoWatermark
+
+    # Create progress monitor for this part
+    part_monitor = pm.create_part_monitor(i, len(split_points))
+    prepared = _prepare_single(part_monitor, part_config, run_context)
+    logger.info(f"part {i} prepared in {time.time() - start_time:.1f}s")
+    return prepared
+
+
+@dataclasses.dataclass
+class _PreparedPart:
+    """A document or split part after the stages that come before translation.
+
+    Holds the callback run, its services and the open input PDF until
+    `close`, which `_finish_single` calls once the part is written.
+    """
+
+    config: TranslationConfig
+    pm: ProgressMonitor
+    doc_pdf2zh: Document
+    temp_pdf_path: Path
+    mediabox_data: dict
+    run: CallbackRun | None = None
+    services: dict = dataclasses.field(default_factory=dict)
+    rust_document: Any = None
+    stage_config_json: str = "{}"
+    debug_paths_json: str = "{}"
+    capture_paths_json: str = "{}"
+
+    def close(self) -> None:
+        try:
+            # The Rust stages normally request these cleanups themselves. Keep
+            # service teardown idempotent for failures before those callbacks.
+            for service_name, method in (
+                ("scan", "close"),
+                ("layout", "close"),
+                ("layout", "close_process_pool"),
+                ("writer", "close"),
+            ):
+                cleanup = getattr(
+                    self.services.get(service_name, (None, 0))[0], method, None
+                )
+                if cleanup is not None:
+                    cleanup()
+        finally:
+            try:
+                if self.run is not None:
+                    run, self.run = self.run, None
+                    run.close()
+            finally:
+                if not self.doc_pdf2zh.is_closed:
+                    self.doc_pdf2zh.close()
+
+
 def _do_translate_single(
     pm: ProgressMonitor,
     translation_config: TranslationConfig,
     run_context,
-) -> TranslateResult:
+) -> TranslateResult | None:
     """Parse and retain native IR through the Rust production entry."""
+    prepared = _prepare_single(pm, translation_config, run_context)
+    if prepared is None:
+        return None
+    return _finish_single(prepared, run_context)
+
+
+def _prepare_single(
+    pm: ProgressMonitor,
+    translation_config: TranslationConfig,
+    run_context,
+) -> _PreparedPart | None:
+    """Parse the PDF and run the CPU-bound stages that come before translation.
+
+    Returns None when only translated pages are kept and none is left.
+    """
     _require_stage_capture_feature(translation_config)
     translation_config.progress_monitor = pm
 
@@ -1108,170 +1209,192 @@ def _do_translate_single(
 
     doc_pdf2zh = save_pdf_with_same_path_fallback(doc_pdf2zh, temp_pdf_path)
 
+    from babeldoc import _rust_il
+
+    prepared = _PreparedPart(
+        config=translation_config,
+        pm=pm,
+        doc_pdf2zh=doc_pdf2zh,
+        temp_pdf_path=temp_pdf_path,
+        mediabox_data=mediabox_data,
+    )
     try:
-        from babeldoc import _rust_il
-
         cancel_event = pm.cancel_event or threading.Event()
-        with CallbackRun({}, cancel_event, _rust_il, record_requests=False) as run:
-            pm.raise_if_cancelled()
-            parser_config = {
-                "disable_parser_resource_limits": translation_config.disable_parser_resource_limits,
-                "pages": [
-                    number
-                    for number in range(doc_pdf2zh.page_count)
-                    if translation_config.should_translate_page(number + 1)
-                ],
-                "enable_graphic_element_process": translation_config.enable_graphic_element_process,
-                "ocr_workaround": translation_config.ocr_workaround,
-                "visual_roundtrip_mode": getattr(
-                    translation_config,
-                    "visual_roundtrip_mode",
-                    False,
-                ),
-            }
-            capture_path = translation_config.get_stage_capture_file_path("parser")
-            debug_path = (
-                translation_config.get_working_file_path("create_il.debug.json")
-                if translation_config.debug
-                else None
-            )
-            logger.debug(f"start parse il from {temp_pdf_path}")
-            rust_document = _rust_il.parse_prepared_pdf_product(
-                str(temp_pdf_path),
-                json.dumps(parser_config),
-                run_context.font_mapper,
-                run_context.shared_context,
-                run.flag,
-                pm,
-                only_include_translated_page=translation_config.only_include_translated_page,
-                capture_path=None if capture_path is None else str(capture_path),
-                debug_path=None if debug_path is None else str(debug_path),
-            )
-            pm.raise_if_cancelled()
-            logger.debug(f"finish parse il from {temp_pdf_path}")
-            if rust_document is None:
-                return None
-            stage_config = (
-                {}
-                if translation_config.only_parse_generate_pdf
-                else _rust_stage_configs(translation_config, run_context)
-            )
-            writer_config, writer_assets, debug_paths = _rust_writer_inputs(
-                translation_config, run_context, temp_pdf_path
-            )
-            capture_paths = {}
-            if translation_config.capture_stages:
-                for stage in (
-                    "scan",
-                    "layout",
-                    "paragraph",
-                    "styles",
-                    "translation",
-                    "typesetting",
-                ):
-                    path = translation_config.get_stage_capture_file_path(stage)
-                    if path is not None:
-                        capture_paths[stage] = str(path)
-            services = {}
-            try:
-                translator = translation_config.translator
-                term_translator = translation_config.get_term_extraction_translator()
-                translation_service = RustTranslatorService(
-                    translator, translation_config, run_context.shared_context
-                )
-                run_context.dispatcher_a.service = translation_service
-                run_context.dispatcher_b.service = translation_service
-                term_service = RustTranslatorService(
-                    term_translator, translation_config, run_context.shared_context
-                )
-                services["scan"] = (ScanFileService(), 1)
-                services["layout"] = (
-                    LayoutService(
-                        translation_config, doc_pdf2zh, run_context.font_mapper
-                    ),
-                    1,
-                )
-                services["translation"] = (
-                    translation_service,
-                    translation_config.pool_max_workers,
-                )
-                services["term"] = (
-                    term_service,
-                    translation_config.term_pool_max_workers,
-                )
-                services["writer"] = (
-                    WriterFileService(translation_config, mediabox_data, temp_pdf_path),
-                    1,
-                )
-                services["debug"] = (RustDebugSerializerService(), 1)
-                services["probe_terms"] = (
-                    TranslatorProbeService(term_translator, translator_supports_llm),
-                    1,
-                )
-                services["probe_translate"] = (
-                    TranslatorProbeService(translator, translator_supports_llm),
-                    1,
-                )
-                run.add_services(services, record_requests=False)
-                run_context.dispatcher_a.cancel_flag = run.flag
-                run_context.dispatcher_b.cancel_flag = run.flag
-                services["layout"][0].flag = run.flag
-                writer_service = services["writer"][0]
-                basename = Path(translation_config.input_file).stem
-                debug_suffix = ".debug" if translation_config.debug else ""
-                if (
-                    translation_config.watermark_output_mode
-                    != WatermarkOutputMode.Watermarked
-                ):
-                    debug_suffix += ".no_watermark"
-                if translation_config.save_auto_extracted_glossary:
-                    writer_service.glossary_path = translation_config.get_output_file_path(
-                        f"{basename}{debug_suffix}.{translation_config.lang_out}.glossary.csv"
-                    )
-                mono_path, dual_path, glossary_path = rust_document.run_part(
-                    run_context.native,
-                    translation_config,
-                    run.executors,
-                    json.dumps(stage_config),
-                    json.dumps(debug_paths),
-                    json.dumps(writer_config),
-                    json.dumps(writer_assets),
-                    run.flag,
-                    pm,
-                    translation_config.capture_stages,
-                    json.dumps(capture_paths),
-                )
-            finally:
-                # The Rust stages normally request these cleanups themselves. Keep
-                # service teardown idempotent for failures before those callbacks.
-                for service_name, method in (
-                    ("scan", "close"),
-                    ("layout", "close"),
-                    ("layout", "close_process_pool"),
-                    ("writer", "close"),
-                ):
-                    cleanup = getattr(
-                        services.get(service_name, (None, 0))[0], method, None
-                    )
-                    if cleanup is not None:
-                        cleanup()
-
-        result = TranslateResult(
-            mono_pdf_path=None if mono_path is None else Path(mono_path),
-            dual_pdf_path=None if dual_path is None else Path(dual_path),
-            auto_extracted_glossary_path=(
-                None if glossary_path is None else Path(glossary_path)
-            ),
+        prepared.run = run = CallbackRun(
+            {}, cancel_event, _rust_il, record_requests=False
         )
-        # only-parse keeps 0.6.4's single no-watermark group even in Both mode.
-        if not translation_config.only_parse_generate_pdf:
-            _copy_both_mode_outputs(result, translation_config)
-        result.original_pdf_path = translation_config.input_file
-        return result
+        pm.raise_if_cancelled()
+        parser_config = {
+            "disable_parser_resource_limits": translation_config.disable_parser_resource_limits,
+            "pages": [
+                number
+                for number in range(doc_pdf2zh.page_count)
+                if translation_config.should_translate_page(number + 1)
+            ],
+            "enable_graphic_element_process": translation_config.enable_graphic_element_process,
+            "ocr_workaround": translation_config.ocr_workaround,
+            "visual_roundtrip_mode": getattr(
+                translation_config,
+                "visual_roundtrip_mode",
+                False,
+            ),
+        }
+        capture_path = translation_config.get_stage_capture_file_path("parser")
+        debug_path = (
+            translation_config.get_working_file_path("create_il.debug.json")
+            if translation_config.debug
+            else None
+        )
+        logger.debug(f"start parse il from {temp_pdf_path}")
+        rust_document = _rust_il.parse_prepared_pdf_product(
+            str(temp_pdf_path),
+            json.dumps(parser_config),
+            run_context.font_mapper,
+            run_context.shared_context,
+            run.flag,
+            pm,
+            only_include_translated_page=translation_config.only_include_translated_page,
+            capture_path=None if capture_path is None else str(capture_path),
+            debug_path=None if debug_path is None else str(debug_path),
+        )
+        pm.raise_if_cancelled()
+        logger.debug(f"finish parse il from {temp_pdf_path}")
+        if rust_document is None:
+            prepared.close()
+            return None
+        prepared.rust_document = rust_document
+        stage_config = (
+            {}
+            if translation_config.only_parse_generate_pdf
+            else _rust_stage_configs(translation_config, run_context)
+        )
+        _, _, debug_paths = _rust_writer_inputs(
+            translation_config, run_context, temp_pdf_path
+        )
+        capture_paths = {}
+        if translation_config.capture_stages:
+            for stage in (
+                "scan",
+                "layout",
+                "paragraph",
+                "styles",
+                "translation",
+                "typesetting",
+            ):
+                path = translation_config.get_stage_capture_file_path(stage)
+                if path is not None:
+                    capture_paths[stage] = str(path)
+        prepared.stage_config_json = json.dumps(stage_config)
+        prepared.debug_paths_json = json.dumps(debug_paths)
+        prepared.capture_paths_json = json.dumps(capture_paths)
+        services = {
+            "scan": (ScanFileService(), 1),
+            "layout": (
+                LayoutService(translation_config, doc_pdf2zh, run_context.font_mapper),
+                1,
+            ),
+            "debug": (RustDebugSerializerService(), 1),
+        }
+        prepared.services.update(services)
+        run.add_services(services, record_requests=False)
+        services["layout"][0].flag = run.flag
+        rust_document.prepare_part(
+            run_context.native,
+            translation_config,
+            run.executors,
+            prepared.stage_config_json,
+            prepared.debug_paths_json,
+            run.flag,
+            pm,
+            translation_config.capture_stages,
+            prepared.capture_paths_json,
+        )
+    except BaseException:
+        prepared.close()
+        raise
+    return prepared
 
+
+def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
+    """Translate a prepared document or part, typeset it and write the PDFs."""
+    translation_config = prepared.config
+    pm = prepared.pm
+    try:
+        run = prepared.run
+        writer_config, writer_assets, _ = _rust_writer_inputs(
+            translation_config, run_context, prepared.temp_pdf_path
+        )
+        translator = translation_config.translator
+        term_translator = translation_config.get_term_extraction_translator()
+        translation_service = RustTranslatorService(
+            translator, translation_config, run_context.shared_context
+        )
+        # The dispatchers belong to the whole document: bind them only here, once
+        # the part before has finished translating.
+        run_context.dispatcher_a.service = translation_service
+        run_context.dispatcher_b.service = translation_service
+        term_service = RustTranslatorService(
+            term_translator, translation_config, run_context.shared_context
+        )
+        services = {
+            "translation": (translation_service, translation_config.pool_max_workers),
+            "term": (term_service, translation_config.term_pool_max_workers),
+            "writer": (
+                WriterFileService(
+                    translation_config, prepared.mediabox_data, prepared.temp_pdf_path
+                ),
+                1,
+            ),
+            "probe_terms": (
+                TranslatorProbeService(term_translator, translator_supports_llm),
+                1,
+            ),
+            "probe_translate": (
+                TranslatorProbeService(translator, translator_supports_llm),
+                1,
+            ),
+        }
+        prepared.services.update(services)
+        run.add_services(services, record_requests=False)
+        run_context.dispatcher_a.cancel_flag = run.flag
+        run_context.dispatcher_b.cancel_flag = run.flag
+        writer_service = services["writer"][0]
+        basename = Path(translation_config.input_file).stem
+        debug_suffix = ".debug" if translation_config.debug else ""
+        if translation_config.watermark_output_mode != WatermarkOutputMode.Watermarked:
+            debug_suffix += ".no_watermark"
+        if translation_config.save_auto_extracted_glossary:
+            writer_service.glossary_path = translation_config.get_output_file_path(
+                f"{basename}{debug_suffix}.{translation_config.lang_out}.glossary.csv"
+            )
+        mono_path, dual_path, glossary_path = prepared.rust_document.finish_part(
+            run_context.native,
+            translation_config,
+            run.executors,
+            prepared.stage_config_json,
+            prepared.debug_paths_json,
+            json.dumps(writer_config),
+            json.dumps(writer_assets),
+            run.flag,
+            pm,
+            translation_config.capture_stages,
+            prepared.capture_paths_json,
+        )
     finally:
-        if not doc_pdf2zh.is_closed:
-            doc_pdf2zh.close()
+        prepared.close()
+
+    result = TranslateResult(
+        mono_pdf_path=None if mono_path is None else Path(mono_path),
+        dual_pdf_path=None if dual_path is None else Path(dual_path),
+        auto_extracted_glossary_path=(
+            None if glossary_path is None else Path(glossary_path)
+        ),
+    )
+    # only-parse keeps 0.6.4's single no-watermark group even in Both mode.
+    if not translation_config.only_parse_generate_pdf:
+        _copy_both_mode_outputs(result, translation_config)
+    result.original_pdf_path = translation_config.input_file
+    return result
 
 
 def _copy_both_mode_outputs(
