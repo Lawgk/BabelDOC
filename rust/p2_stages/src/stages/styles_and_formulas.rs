@@ -65,6 +65,13 @@ fn classify_characters_in_composition(
     let mut in_corner_mark_state = false;
     let mut is_formula_tags = Vec::with_capacity(line.pdf_character.len());
     let mut corner_mark_flags = Vec::with_capacity(line.pdf_character.len());
+    let accent_bases = lh::floating_accent_bases(
+        &line
+            .pdf_character
+            .iter()
+            .map(lh::AccentGlyph::of)
+            .collect::<Vec<_>>(),
+    );
     for (index, character) in line.pdf_character.iter().enumerate() {
         let is_start_of_segment = index == 0
             || is_formula_tags
@@ -152,7 +159,7 @@ fn classify_characters_in_composition(
                 && current_size < next_size * 0.79
                 && !in_corner_mark_state);
         is_formula |= is_corner_mark;
-        if character.char_unicode.as_deref() == Some(" ") {
+        if character.char_unicode.as_deref() == Some(" ") || accent_bases.contains_key(&index) {
             is_formula = in_formula_state;
         }
         if is_formula != in_formula_state {
@@ -161,6 +168,12 @@ fn classify_characters_in_composition(
         in_corner_mark_state = is_corner_mark;
         is_formula_tags.push(is_formula);
         corner_mark_flags.push(is_corner_mark);
+    }
+    // A floating accent follows the letter it is struck over instead of
+    // becoming a formula of its own.
+    for (&accent, &base) in &accent_bases {
+        is_formula_tags[accent] = is_formula_tags[base];
+        corner_mark_flags[accent] = corner_mark_flags[base];
     }
     Ok((
         is_formula_tags.into_iter().zip(corner_mark_flags).collect(),

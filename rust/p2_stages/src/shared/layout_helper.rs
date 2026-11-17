@@ -3,6 +3,7 @@
 //! `LayoutIndex` uses the libspatialindex 2.1.0 R*-tree compatibility port so
 //! candidate order matches 0.6.4 for the shared layout-helper queries.
 
+use std::collections::BTreeMap;
 use std::sync::LazyLock;
 
 use babeldoc_font_core::FontFace;
@@ -658,6 +659,94 @@ pub enum UnicodePart<'a> {
     Text(&'a str),
 }
 
+/// Spacing accents and the combining marks they stand for. Some PDFs draw an
+/// accented letter as the bare letter plus a spacing accent struck over it:
+/// Advent 3B2 draws the accent after the letter, TeX's \accent before it.
+const FLOATING_ACCENTS: [(char, char); 13] = [
+    ('`', '\u{300}'),
+    ('´', '\u{301}'),
+    ('ˆ', '\u{302}'),
+    ('˜', '\u{303}'),
+    ('¯', '\u{304}'),
+    ('˘', '\u{306}'),
+    ('˙', '\u{307}'),
+    ('¨', '\u{308}'),
+    ('˚', '\u{30a}'),
+    ('˝', '\u{30b}'),
+    ('ˇ', '\u{30c}'),
+    ('¸', '\u{327}'),
+    ('˛', '\u{328}'),
+];
+
+fn single_char(text: &str) -> Option<char> {
+    let mut chars = text.chars();
+    let first = chars.next()?;
+    chars.next().is_none().then_some(first)
+}
+
+/// The combining mark for `text` if it is a single spacing accent.
+pub fn combining_accent(text: &str) -> Option<char> {
+    let ch = single_char(text)?;
+    FLOATING_ACCENTS
+        .iter()
+        .find_map(|&(accent, mark)| (accent == ch).then_some(mark))
+}
+
+/// What `floating_accent_bases` needs to know about a glyph.
+pub struct AccentGlyph<'a> {
+    pub text: &'a str,
+    pub font_id: Option<&'a str>,
+    /// (x, y, x2, y2)
+    pub bbox: (f64, f64, f64, f64),
+}
+
+impl<'a> AccentGlyph<'a> {
+    pub fn of(character: &'a PdfCharacter) -> Option<Self> {
+        let b = character.r#box.as_deref()?;
+        Some(Self {
+            text: character.char_unicode.as_deref()?,
+            font_id: character
+                .pdf_style
+                .as_deref()
+                .and_then(|style| style.font_id.as_deref()),
+            bbox: (b.x?, b.y?, b.x2?, b.y2?),
+        })
+    }
+}
+
+/// Floating accents struck over an adjacent letter, as {accent index: letter
+/// index}: same font, the accent's horizontal centre inside the letter's box,
+/// and the two overlapping vertically. The letter before is tried first.
+pub fn floating_accent_bases(glyphs: &[Option<AccentGlyph<'_>>]) -> BTreeMap<usize, usize> {
+    let mut bases = BTreeMap::new();
+    for (i, accent) in glyphs.iter().enumerate() {
+        let Some(accent) = accent.as_ref().filter(|g| combining_accent(g.text).is_some()) else {
+            continue;
+        };
+        let (ax, ay, ax2, ay2) = accent.bbox;
+        let center = (ax + ax2) / 2.0;
+        for j in [i.checked_sub(1), Some(i + 1)].into_iter().flatten() {
+            let Some(Some(base)) = glyphs.get(j) else {
+                continue;
+            };
+            let (bx, by, bx2, by2) = base.bbox;
+            let letter = single_char(base.text)
+                .is_some_and(|ch| ch.is_alphabetic() && combining_accent(base.text).is_none());
+            if letter
+                && base.font_id == accent.font_id
+                && bx <= center
+                && center <= bx2
+                && by < ay2
+                && ay < by2
+            {
+                bases.insert(i, j);
+                break;
+            }
+        }
+    }
+    bases
+}
+
 pub fn get_char_unicode_string(parts: &[UnicodePart<'_>]) -> Result<String, LayoutHelperError> {
     let mut distances = Vec::new();
     for pair in parts.windows(2) {
@@ -687,8 +776,30 @@ pub fn get_char_unicode_string(parts: &[UnicodePart<'_>]) -> Result<String, Layo
         [one] => *one,
         many => many[1],
     };
+    // Floating accents struck over a letter fold into it as combining marks,
+    // which NFKC composes. After the gap statistics, so spaces elsewhere
+    // are judged as before.
+    let glyphs = parts
+        .iter()
+        .map(|part| match part {
+            UnicodePart::Character(character) => AccentGlyph::of(character),
+            UnicodePart::Text(_) => None,
+        })
+        .collect::<Vec<_>>();
+    let accent_bases = floating_accent_bases(&glyphs);
+    let mut marks = BTreeMap::<usize, String>::new();
+    for (&accent, &base) in &accent_bases {
+        if let Some(mark) = glyphs[accent].as_ref().and_then(|g| combining_accent(g.text)) {
+            marks.entry(base).or_default().push(mark);
+        }
+    }
+    let kept = parts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !accent_bases.contains_key(index))
+        .collect::<Vec<_>>();
     let mut pieces = Vec::new();
-    for (index, part) in parts.iter().enumerate() {
+    for (position, &(index, part)) in kept.iter().enumerate() {
         let UnicodePart::Character(character) = part else {
             if let UnicodePart::Text(text) = part {
                 pieces.push((*text).to_owned());
@@ -696,11 +807,14 @@ pub fn get_char_unicode_string(parts: &[UnicodePart<'_>]) -> Result<String, Layo
             continue;
         };
         let text = character.char_unicode.as_deref().unwrap_or_default();
-        pieces.push(collapse_nfkc_spaces(text));
+        match marks.get(&index) {
+            Some(mark) => pieces.push(collapse_nfkc_spaces(&format!("{text}{mark}"))),
+            None => pieces.push(collapse_nfkc_spaces(text)),
+        }
         if text == " " {
             continue;
         }
-        if let Some(UnicodePart::Character(next)) = parts.get(index + 1) {
+        if let Some((_, UnicodePart::Character(next))) = kept.get(position + 1) {
             let current_box = character
                 .r#box
                 .as_deref()

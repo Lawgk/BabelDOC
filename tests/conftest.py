@@ -7,15 +7,23 @@ import pytest
 HELVETICA = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
 
 
-def build_pdf(content: bytes, font: bytes = HELVETICA) -> bytes:
-    """One US-Letter page drawing `content`, with `font` (Helvetica) as /F1."""
+def build_pdf(content: bytes, font: bytes = HELVETICA, extra_fonts=None) -> bytes:
+    """One US-Letter page drawing `content`, with `font` (Helvetica) as /F1.
+
+    `extra_fonts` maps further resource names (b"F2") to font dictionaries.
+    """
+    extra_fonts = extra_fonts or {}
+    names = b"".join(
+        b" /%s %d 0 R" % (name, 6 + index) for index, name in enumerate(extra_fonts)
+    )
     objects = [
         b"<< /Type /Catalog /Pages 2 0 R >>",
         b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
         b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
-        b" /Resources << /Font << /F1 4 0 R >> >> /Contents 5 0 R >>",
+        b" /Resources << /Font << /F1 4 0 R%s >> >> /Contents 5 0 R >>" % names,
         font,
         b"<< /Length %d >>\nstream\n" % len(content) + content + b"\nendstream",
+        *extra_fonts.values(),
     ]
     out = bytearray(b"%PDF-1.7\n")
     offsets = []
@@ -98,8 +106,10 @@ class _EchoTranslator:
             def __init__(self):
                 super().__init__("en", "zh", ignore_cache=True)
                 self.model = "echo"
+                self.inputs: list[str] = []
 
             def do_translate(self, text, rate_limit_params: dict = None):
+                self.inputs.append(text)
                 return text
 
             def do_llm_translate(self, text, rate_limit_params: dict = None):
@@ -107,19 +117,25 @@ class _EchoTranslator:
                     return None
                 batch = _last_input_array(text)
                 if batch is not None:
+                    self.inputs.extend(str(i["input"]) for i in batch)
                     return json.dumps(
                         [{"id": i["id"], "output": i["input"]} for i in batch],
                         ensure_ascii=False,
                     )
                 # Single-paragraph fallback: the paragraph follows this marker.
-                return text.rsplit("Now translate the following text:\n\n", 1)[-1]
+                paragraph = text.rsplit("Now translate the following text:\n\n", 1)[-1]
+                self.inputs.append(paragraph)
+                return paragraph
 
         return Echo()
 
 
 @pytest.fixture
 def translate_pdf(tmp_path):
-    """Run the whole pipeline on raw PDF bytes; return (mono path, stage times)."""
+    """Run the whole pipeline on raw PDF bytes; return (mono path, stage times).
+
+    The texts sent for translation are left in `translate_pdf.inputs`.
+    """
     import asyncio
 
     from babeldoc.format.pdf import high_level
@@ -132,6 +148,7 @@ def translate_pdf(tmp_path):
         source = tmp_path / "in.pdf"
         source.write_bytes(pdf)
         translator = _EchoTranslator.build()
+        run.inputs = translator.inputs
         config = TranslationConfig(
             translator,
             str(source),
@@ -166,4 +183,5 @@ def translate_pdf(tmp_path):
         result = asyncio.run(drive())
         return result.mono_pdf_path, stages
 
+    run.inputs = []
     return run

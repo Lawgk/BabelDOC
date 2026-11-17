@@ -1001,6 +1001,7 @@ enum InputTextPart {
     Character {
         text: String,
         coords: Option<(f64, f64, f64, f64)>,
+        font_id: Option<String>,
     },
     Text(String),
 }
@@ -1035,7 +1036,15 @@ fn character_fragments(
                     ))
                 })
                 .transpose()?;
-            Ok(InputTextPart::Character { text, coords })
+            let font_id = match character.pdf_style(view).map_err(access)? {
+                Some(style) => style.font_id(view).map_err(access)?.clone(),
+                None => None,
+            };
+            Ok(InputTextPart::Character {
+                text,
+                coords,
+                font_id,
+            })
         })
         .collect()
 }
@@ -1061,6 +1070,10 @@ fn normalize_character_text(text: &str) -> String {
     }
     output
 }
+
+use babeldoc_p2_stages::shared::layout_helper::{
+    AccentGlyph, combining_accent, floating_accent_bases,
+};
 
 fn compose_input_text(parts: &[InputTextPart]) -> String {
     let mut distances = parts
@@ -1089,22 +1102,57 @@ fn compose_input_text(parts: &[InputTextPart]) -> String {
         [only] => *only,
         many => many[1],
     };
+    // Floating accents struck over a letter fold into it as combining marks,
+    // as in layout_helper::get_char_unicode_string.
+    let glyphs = parts
+        .iter()
+        .map(|part| match part {
+            InputTextPart::Character {
+                text,
+                coords: Some(bbox),
+                font_id,
+            } => Some(AccentGlyph {
+                text,
+                font_id: font_id.as_deref(),
+                bbox: *bbox,
+            }),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let accent_bases = floating_accent_bases(&glyphs);
+    let mut marks = std::collections::BTreeMap::<usize, String>::new();
+    for (&accent, &base) in &accent_bases {
+        if let Some(mark) = glyphs[accent].as_ref().and_then(|g| combining_accent(g.text)) {
+            marks.entry(base).or_default().push(mark);
+        }
+    }
+    let kept = parts
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !accent_bases.contains_key(index))
+        .collect::<Vec<_>>();
     let mut output = String::new();
-    for (index, part) in parts.iter().enumerate() {
+    for (position, &(index, part)) in kept.iter().enumerate() {
         match part {
             InputTextPart::Text(text) => output.push_str(text),
-            InputTextPart::Character { text, coords } => {
-                output.push_str(&normalize_character_text(text));
+            InputTextPart::Character { text, coords, .. } => {
+                match marks.get(&index) {
+                    Some(mark) => output.push_str(&normalize_character_text(&format!("{text}{mark}"))),
+                    None => output.push_str(&normalize_character_text(text)),
+                }
                 if text == " " {
                     continue;
                 }
                 if let (
                     Some((x, y, x2, y2)),
-                    Some(InputTextPart::Character {
-                        coords: Some((next_x, next_y, next_x2, next_y2)),
-                        ..
-                    }),
-                ) = (coords, parts.get(index + 1))
+                    Some((
+                        _,
+                        InputTextPart::Character {
+                            coords: Some((next_x, next_y, next_x2, next_y2)),
+                            ..
+                        },
+                    )),
+                ) = (coords, kept.get(position + 1))
                 {
                     let distance = next_x - x2;
                     let char_height = (y2 - y).max(next_y2 - next_y);
