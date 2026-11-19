@@ -116,3 +116,38 @@ def test_a_failing_part_stops_the_others(monkeypatch, translate_pdf):
     with pytest.raises(RuntimeError):
         translate_pdf(_book(), **_parts())
     assert not [t for t in threading.enumerate() if t.name.startswith("babeldoc-part-")]
+
+
+def test_parts_run_their_pdf_child_processes_one_at_a_time(monkeypatch, translate_pdf):
+    # Each child holds a copy of its part's PDF; two at once would add up.
+    from babeldoc.format.pdf.document_il.backend.pdf_creater import PDFCreater
+
+    monkeypatch.setenv(high_level.PARTS_IN_FLIGHT_ENV, "2")
+    finishing = _track_finishes(monkeypatch, linger=30)
+    joined = threading.Condition()
+    children = {"active": 0, "most": 0, "calls": 0}
+
+    def tracked(original):
+        def call(*args, **kwargs):
+            with joined:
+                children["active"] += 1
+                children["calls"] += 1
+                children["most"] = max(children["most"], children["active"])
+                joined.notify_all()
+                if children["calls"] == 1:
+                    # Give the other part time to reach a child process of its own.
+                    joined.wait_for(lambda: children["most"] >= 2, timeout=10)
+            try:
+                return original(*args, **kwargs)
+            finally:
+                with joined:
+                    children["active"] -= 1
+
+        return call
+
+    for name in ("subset_fonts_in_subprocess", "save_pdf_with_timeout"):
+        monkeypatch.setattr(PDFCreater, name, staticmethod(tracked(getattr(PDFCreater, name))))
+    translate_pdf(_book(), **_parts())
+    assert finishing["most"] == 2
+    assert children["calls"] >= 3
+    assert children["most"] == 1

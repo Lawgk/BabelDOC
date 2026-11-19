@@ -5,6 +5,7 @@ PDF operations retain the existing writer's subprocess and fallback behavior.
 """
 
 import logging
+from contextlib import nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,8 +19,12 @@ logger = logging.getLogger(__name__)
 class WriterFileService:
     cleanup_methods = frozenset({"close"})
 
-    def __init__(self, config, mediabox_data, original_path):
+    def __init__(self, config, mediabox_data, original_path, child_lock=None):
         self.config = config
+        # Font subsetting and saving each run in a child process holding a copy
+        # of the part's PDF; parts finishing at once share this lock so their
+        # children never add up.
+        self.child_lock = child_lock if child_lock is not None else nullcontext()
         self.mediabox_data = mediabox_data
         self.creator = PDFCreater.__new__(PDFCreater)
         self.creator.original_pdf_path = original_path
@@ -39,18 +44,18 @@ class WriterFileService:
         self.original = self._own(pymupdf.open(path))
 
     def subset_mono(self):
-        self.translated = self._own(
-            self.creator.subset_fonts_in_subprocess(
+        with self.child_lock:
+            subset = self.creator.subset_fonts_in_subprocess(
                 self.translated, self.config, tag="mono"
             )
-        )
+        self.translated = self._own(subset)
 
     def subset_debug(self):
-        self.original = self._own(
-            self.creator.subset_fonts_in_subprocess(
+        with self.child_lock:
+            subset = self.creator.subset_fonts_in_subprocess(
                 self.original, self.config, tag="debug"
             )
-        )
+        self.original = self._own(subset)
 
     def restore_media_box(self):
         try:
@@ -73,17 +78,18 @@ class WriterFileService:
         self.dual.save(path, expand=True, pretty=True)
 
     def _save(self, pdf, path, garbage, clean, tag):
-        return self.creator.save_pdf_with_timeout(
-            pdf,
-            path,
-            self.config,
-            garbage=garbage,
-            deflate=True,
-            clean=clean,
-            deflate_fonts=True,
-            linear=False,
-            tag=tag,
-        )
+        with self.child_lock:
+            return self.creator.save_pdf_with_timeout(
+                pdf,
+                path,
+                self.config,
+                garbage=garbage,
+                deflate=True,
+                clean=clean,
+                deflate_fonts=True,
+                linear=False,
+                tag=tag,
+            )
 
     def save_mono(self, path, garbage, clean):
         self._save(self.translated, path, garbage, clean, "mono")

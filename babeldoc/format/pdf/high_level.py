@@ -1425,7 +1425,10 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
             "term": (term_service, translation_config.term_pool_max_workers),
             "writer": (
                 WriterFileService(
-                    translation_config, prepared.mediabox_data, prepared.temp_pdf_path
+                    translation_config,
+                    prepared.mediabox_data,
+                    prepared.temp_pdf_path,
+                    run_context.child_process_lock,
                 ),
                 1,
             ),

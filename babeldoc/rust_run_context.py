@@ -85,6 +85,8 @@ class DocumentRunContext:
         self.translation_service = None
         self.translation_service_lock = threading.Lock()
         self.live_part_flags = LivePartFlags()
+        # Held while a part runs a PDF child process (font subsetting, saving).
+        self.child_process_lock = threading.Lock()
         dispatcher_a.cancel_flag = self.live_part_flags
         dispatcher_b.cancel_flag = self.live_part_flags
         self.native = _rust_il.DocumentRunContext(
