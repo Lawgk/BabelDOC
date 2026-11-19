@@ -37,6 +37,8 @@ from babeldoc.format.pdf.translation_config import TranslateResult
 from babeldoc.format.pdf.translation_config import TranslationConfig
 from babeldoc.format.pdf.translation_config import WatermarkOutputMode
 from babeldoc.progress_monitor import ProgressMonitor
+from babeldoc.timing import RequestLatency
+from babeldoc.timing import stage_summary
 from babeldoc.rust_callback_bridge import CallbackRun
 from babeldoc.rust_debug_service import RustDebugSerializerService
 from babeldoc.rust_layout_service import LayoutService
@@ -759,6 +761,7 @@ def do_translate(
         logger.info(
             f"finish translate: {original_pdf_path}, cost: {finish_time - start_time} s",
         )
+        _log_document_timing(pm, finish_time - start_time)
         # Populate aggregate valid text statistics into result
         try:
             sc = translation_config.shared_context_cross_split_part
@@ -1319,6 +1322,8 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
     """Translate a prepared document or part, typeset it and write the PDFs."""
     translation_config = prepared.config
     pm = prepared.pm
+    finish_start = time.monotonic()
+    translation_service = None
     try:
         run = prepared.run
         writer_config, writer_assets, _ = _rust_writer_inputs(
@@ -1382,6 +1387,7 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
         )
     finally:
         prepared.close()
+        _log_part_timing(pm, translation_service, time.monotonic() - finish_start)
 
     result = TranslateResult(
         mono_pdf_path=None if mono_path is None else Path(mono_path),
@@ -1395,6 +1401,40 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
         _copy_both_mode_outputs(result, translation_config)
     result.original_pdf_path = translation_config.input_file
     return result
+
+
+def _log_part_timing(pm: ProgressMonitor, translation_service, seconds: float) -> None:
+    """One line per part: its stages and its translator requests."""
+    try:
+        latency = getattr(translation_service, "latency", None) or RequestLatency()
+        part = (pm.part_index or 0) + 1
+        logger.info(
+            f"part {part}/{pm.total_parts or 1} timing: translation onwards {seconds:.1f}s; "
+            f"stages: {stage_summary(pm.stage_seconds)}; translator: {latency.summary()}"
+        )
+        root = pm.parent_monitor or pm
+        root.part_timings.append((dict(pm.stage_seconds), latency))
+    except Exception:
+        logger.warning("could not log part timing", exc_info=True)
+
+
+def _log_document_timing(pm: ProgressMonitor, seconds: float) -> None:
+    """The sum over parts, when there is more than one."""
+    try:
+        if len(pm.part_timings) < 2:
+            return
+        stages: dict[str, float] = {}
+        latency = RequestLatency()
+        for part_stages, part_latency in pm.part_timings:
+            for name, value in part_stages.items():
+                stages[name] = stages.get(name, 0.0) + value
+            latency.merge(part_latency)
+        logger.info(
+            f"document timing: {seconds:.1f}s over {len(pm.part_timings)} parts; "
+            f"stages: {stage_summary(stages)}; translator: {latency.summary()}"
+        )
+    except Exception:
+        logger.warning("could not log document timing", exc_info=True)
 
 
 def _copy_both_mode_outputs(

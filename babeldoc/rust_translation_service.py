@@ -6,6 +6,8 @@ import re
 import threading
 from typing import Any
 
+from babeldoc.timing import RequestLatency
+
 
 class RustTranslatorService:
     """Expose translator methods through the callback dispatcher."""
@@ -23,6 +25,7 @@ class RustTranslatorService:
         self._regex_patterns: dict[int, re.Pattern[str]] = {}
         self._regex_keys: dict[tuple[str, int], int] = {}
         self._next_regex_id = 0
+        self.latency = RequestLatency()
 
     def supports_llm(self) -> bool:
         """Match high_level.translator_supports_llm, including its broad catch."""
@@ -87,14 +90,16 @@ class RustTranslatorService:
         )
 
     def translate(self, text: str, rate_limit_params: dict[str, Any] | None = None):
-        return self.translator.translate(text, rate_limit_params=rate_limit_params)
+        with self.latency.measure("translate"):
+            return self.translator.translate(text, rate_limit_params=rate_limit_params)
 
     def llm_translate(
         self, prompt: str, rate_limit_params: dict[str, Any] | None = None
     ):
-        return self.translator.llm_translate(
-            prompt, rate_limit_params=rate_limit_params
-        )
+        with self.latency.measure("llm_translate"):
+            return self.translator.llm_translate(
+                prompt, rate_limit_params=rate_limit_params
+            )
 
     def regex_compile(self, pattern: str, flags: int = 0) -> int:
         key = (pattern, flags)

@@ -33,6 +33,10 @@ class ProgressMonitor:
         # Set by a caller that prepares parts ahead of time: only this part's progress is
         # reported, so overall progress never jumps between parts. None reports every part.
         self.reporting_part_index: int | None = None
+        # Seconds each stage of this monitor took, in the order they ran.
+        self.stage_seconds: dict[str, float] = {}
+        # Timing of each finished part, collected on the document's monitor.
+        self.part_timings: list[tuple[dict[str, float], object]] = []
 
         # Convert stages list to dict with name and weight
         self.stage = {}
@@ -125,6 +129,7 @@ class ProgressMonitor:
         stage.display_name = f"{stage_name}" if stage.run_time > 1 else stage_name
         stage.current = 0
         stage.total = total
+        stage.started_at = time.monotonic()
         if self.progress_change_callback:
             self.progress_change_callback(
                 type="progress_start",
@@ -160,6 +165,12 @@ class ProgressMonitor:
             return
         self.last_report_time = 0.0
         self.finish_stage_count += 1
+        started_at = getattr(stage, "started_at", None)
+        if started_at is not None:
+            self.stage_seconds[stage.name] = self.stage_seconds.get(stage.name, 0.0) + (
+                time.monotonic() - started_at
+            )
+            stage.started_at = None
         if (
             stage.current != stage.total
             and self.cancel_event is not None
@@ -283,6 +294,7 @@ class TranslationStage:
         self.total = total
         self.pm = pm
         self.run_time = 0
+        self.started_at: float | None = None
         self.weight = weight
         self.lock = lock
 
