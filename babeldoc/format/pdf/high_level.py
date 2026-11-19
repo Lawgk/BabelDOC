@@ -565,6 +565,58 @@ def fix_null_xref(doc: Document) -> None:
             doc.update_object(i, "[]")
 
 
+def _has_descendant(doc: Document, xref: int) -> bool:
+    kind, value = doc.xref_get_key(xref, "DescendantFonts")
+    if kind == "xref":
+        value = doc.xref_object(int(value.split()[0]), compressed=True)
+    elif kind != "array":
+        return False
+    return value.strip().startswith("[") and bool(value.strip().strip("[]").strip())
+
+
+def fix_type0_without_descendants(doc: Document) -> list[int]:
+    """Give each Type0 font that has no descendant a stand-in CIDFont.
+
+    PD4ML writes a Type0 font with no /DescendantFonts for a glyph it could not
+    embed (the check marks of an HTML table) and draws only empty strings with
+    it. The parser needs the descendant and fails the whole document; MuPDF
+    just skips the font. A non-embedded Identity CIDFont keeps the document
+    parseable, and text shown with it still decodes through the font's own
+    /Encoding and /ToUnicode.
+    """
+    fixed = []
+    for xref in range(1, doc.xref_length()):
+        try:
+            if doc.xref_get_key(xref, "Subtype") != ("name", "/Type0"):
+                continue
+            if _has_descendant(doc, xref):
+                continue
+            kind, base = doc.xref_get_key(xref, "BaseFont")
+            if kind != "name":
+                base = "/Unknown"
+            descriptor = doc.get_new_xref()
+            doc.update_object(
+                descriptor,
+                f"<</Type/FontDescriptor/FontName{base}/Flags 32"
+                "/FontBBox[0 0 1000 1000]/ItalicAngle 0/Ascent 1000/Descent 0"
+                "/CapHeight 1000/StemV 80>>",
+            )
+            descendant = doc.get_new_xref()
+            doc.update_object(
+                descendant,
+                f"<</Type/Font/Subtype/CIDFontType2/BaseFont{base}"
+                "/CIDSystemInfo<</Registry(Adobe)/Ordering(Identity)/Supplement 0>>"
+                f"/FontDescriptor {descriptor} 0 R/DW 1000/CIDToGIDMap/Identity>>",
+            )
+            doc.xref_set_key(xref, "DescendantFonts", f"[{descendant} 0 R]")
+            fixed.append(xref)
+        except Exception:
+            logger.warning(f"failed to check Type0 font {xref}", exc_info=True)
+    if fixed:
+        logger.info(f"gave {len(fixed)} Type0 fonts without descendants a stand-in")
+    return fixed
+
+
 def fix_filter(doc):
     page_contents = []
     for page in doc:
@@ -1262,6 +1314,7 @@ def _prepare_single(
             _ = fix_null_page_content(doc_input)
             fix_filter(doc_input)
             fix_null_xref(doc_input)
+            fix_type0_without_descendants(doc_input)
         except Exception:
             logger.exception("auto fix failed, please check the pdf file")
         safe_save(doc_input, output_path, expand=True, pretty=True)
@@ -1280,6 +1333,7 @@ def _prepare_single(
         derotate_upright_pages(doc_pdf2zh)
         fix_filter(doc_pdf2zh)
         fix_null_xref(doc_pdf2zh)
+        fix_type0_without_descendants(doc_pdf2zh)
     except Exception:
         logger.exception("auto fix failed, please check the pdf file")
 
