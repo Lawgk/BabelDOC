@@ -53,8 +53,14 @@ def test_a_failing_part_releases_the_part_prepared_ahead(
 ):
     from babeldoc.format.pdf import high_level
 
-    closed = []
-    close = high_level._PreparedPart.close
+    prepared, closed = [], []
+    prepare, close = high_level._prepare_part, high_level._PreparedPart.close
+
+    def tracking_prepare(pm, config, doc, split_points, i, run_context):
+        part = prepare(pm, config, doc, split_points, i, run_context)
+        if part is not None:
+            prepared.append(i)
+        return part
 
     def tracking_close(self):
         closed.append(self.config._capture_part_index)
@@ -64,12 +70,16 @@ def test_a_failing_part_releases_the_part_prepared_ahead(
         prepared.close()
         raise RuntimeError("part failed")
 
+    monkeypatch.setattr(high_level, "_prepare_part", tracking_prepare)
     monkeypatch.setattr(high_level._PreparedPart, "close", tracking_close)
     monkeypatch.setattr(high_level, "_finish_single", failing_finish)
     with pytest.raises(RuntimeError, match="part failed"):
         translate_pdf(_book(), split_strategy=_split(2))
-    # Part 0 failed; part 1, prepared ahead of it, was closed too.
-    assert set(closed) == {0, 1}
+    # Part 0 failed; part 1, prepared ahead of it (or cancelled while being
+    # prepared), was closed too, and so was any later part already prepared
+    # while parts finish in parallel.
+    assert {0, 1} <= set(closed)
+    assert set(prepared) <= set(closed)
     assert not _prefetch_threads()
 
 

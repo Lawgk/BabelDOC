@@ -64,7 +64,11 @@ def test_document_timing_sums_the_parts(translate_pdf, caplog):
         translate_pdf(_book(4), split_strategy=_split(2))
     parts = [r.getMessage() for r in caplog.records if re.match(r"part \d/2 timing", r.getMessage())]
     assert len(parts) == 2
+    # Parts share one translation service, so requests are counted per document.
+    assert not any("translator:" in p for p in parts)
     document = next(r.getMessage() for r in caplog.records if "document timing" in r.getMessage())
     assert "over 2 parts" in document
-    requests = [int(re.search(r"translator: requests (\d+)", p).group(1)) for p in parts]
-    assert f"translator: requests {sum(requests)} " in document
+    assert re.search(r"translator: requests [1-9]", document)
+    seconds = [float(re.search(r"Translate Paragraphs ([\d.]+)s", p).group(1)) for p in parts]
+    total = float(re.search(r"Translate Paragraphs ([\d.]+)s", document).group(1))
+    assert abs(total - sum(seconds)) < 0.2

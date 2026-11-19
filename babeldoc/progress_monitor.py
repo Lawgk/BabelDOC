@@ -36,7 +36,7 @@ class ProgressMonitor:
         # Seconds each stage of this monitor took, in the order they ran.
         self.stage_seconds: dict[str, float] = {}
         # Timing of each finished part, collected on the document's monitor.
-        self.part_timings: list[tuple[dict[str, float], object]] = []
+        self.part_timings: list[dict[str, float]] = []
 
         # Convert stages list to dict with name and weight
         self.stage = {}

@@ -1,5 +1,6 @@
 import asyncio
 import copy
+import os
 import dataclasses
 import hashlib
 import json
@@ -9,8 +10,10 @@ import shutil
 import threading
 import time
 from asyncio import CancelledError
+from concurrent.futures import FIRST_COMPLETED
 from concurrent.futures import Future
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait
 from pathlib import Path
 from typing import Any
 
@@ -671,77 +674,14 @@ def do_translate(
                             translation_config.watermark_output_mode
                         )
                         original_doc = Document(original_pdf_path)
-                        # Parsing and layout are CPU-bound while translation mostly
-                        # waits on the translator, so part i+1 is prepared in the
-                        # background while part i is translated. Never more than one
-                        # part ahead, to bound memory.
-                        prefetch = ThreadPoolExecutor(
-                            max_workers=1, thread_name_prefix="babeldoc-part-prefetch"
+                        _translate_parts(
+                            pm,
+                            translation_config,
+                            original_doc,
+                            split_points,
+                            run_context,
+                            results,
                         )
-                        next_part: Future | None = None
-                        try:
-                            for i in range(len(split_points)):
-                                try:
-                                    pm.reporting_part_index = i
-                                    if next_part is None:
-                                        prepared_part = _prepare_part(
-                                            pm,
-                                            translation_config,
-                                            original_doc,
-                                            split_points,
-                                            i,
-                                            run_context,
-                                        )
-                                    else:
-                                        wait_start = time.time()
-                                        prepared_part = next_part.result()
-                                        next_part = None
-                                        logger.info(
-                                            f"part {i} was prepared ahead, "
-                                            f"waited {time.time() - wait_start:.1f}s for it"
-                                        )
-                                    if i + 1 < len(split_points):
-                                        next_part = prefetch.submit(
-                                            _prepare_part,
-                                            pm,
-                                            translation_config,
-                                            original_doc,
-                                            split_points,
-                                            i + 1,
-                                            run_context,
-                                        )
-                                    results[i] = (
-                                        None
-                                        if prepared_part is None
-                                        else _finish_single(prepared_part, run_context)
-                                    )
-                                    # Release this part's IR before waiting for the next one
-                                    prepared_part = None
-                                except Exception as e:
-                                    logger.error(f"Error in part {i}: {e}")
-                                    pm.translate_error(e)
-                                    raise
-                                finally:
-                                    # Clean up part working directory
-                                    translation_config.cleanup_part_working_dir(i)
-                        finally:
-                            if (
-                                next_part is not None
-                                and not next_part.done()
-                                and pm.cancel_event is not None
-                            ):
-                                # Only on failure: stop the part being prepared before
-                                # its working directory is removed.
-                                pm.cancel_event.set()
-                            prefetch.shutdown(wait=True)
-                            if (
-                                next_part is not None
-                                and next_part.exception() is None
-                                and next_part.result() is not None
-                            ):
-                                # Prepared ahead of a failure: it still holds its
-                                # callback run and its input PDF.
-                                next_part.result().close()
 
                         # Restore original watermark mode
                         translation_config.watermark_output_mode = (
@@ -761,7 +701,7 @@ def do_translate(
         logger.info(
             f"finish translate: {original_pdf_path}, cost: {finish_time - start_time} s",
         )
-        _log_document_timing(pm, finish_time - start_time)
+        _log_document_timing(pm, run_context, finish_time - start_time)
         # Populate aggregate valid text statistics into result
         try:
             sc = translation_config.shared_context_cross_split_part
@@ -1031,6 +971,144 @@ def _rust_writer_inputs(config, run_context, temp_pdf_path):
         "typesetting": str(config.get_working_file_path("typsetting.json")),
     }
     return writer_config, writer_assets, paths
+
+
+PARTS_IN_FLIGHT_ENV = "BABELDOC_PARTS_IN_FLIGHT"
+
+
+def parts_in_flight(translation_config: TranslationConfig) -> int:
+    """How many parts may be past preparation (translating, typesetting) at once.
+
+    1, the default, finishes parts one after another. More lets the next part
+    start translating while the one before still waits on its slowest
+    translator requests. Automatic term extraction keeps 1: each part extracts
+    terms with the glossary the parts before it built.
+    """
+    raw = os.environ.get(PARTS_IN_FLIGHT_ENV, "").strip()
+    if not raw:
+        return 1
+    try:
+        count = int(raw)
+    except ValueError:
+        count = 0
+    if count < 1:
+        logger.warning("Ignoring %s=%r: expected a positive integer", PARTS_IN_FLIGHT_ENV, raw)
+        return 1
+    if count > 1 and translation_config.auto_extract_glossary:
+        logger.info("Automatic term extraction is on: finishing parts one at a time")
+        return 1
+    return count
+
+
+def _translate_parts(
+    pm: ProgressMonitor,
+    translation_config: TranslationConfig,
+    original_doc: Document,
+    split_points: list[SplitPoint],
+    run_context,
+    results: dict,
+) -> None:
+    """Prepare and finish every part, storing each part's result by index.
+
+    Parsing and layout are CPU-bound while translation mostly waits on the
+    translator, so the next part is always prepared in the background (never
+    more than one ahead, to bound memory) while up to `parts_in_flight` parts
+    translate, typeset and write.
+    """
+    in_flight = parts_in_flight(translation_config)
+    count = len(split_points)
+    prefetch = ThreadPoolExecutor(max_workers=1, thread_name_prefix="babeldoc-part-prefetch")
+    finisher = ThreadPoolExecutor(
+        max_workers=in_flight, thread_name_prefix="babeldoc-part-finish"
+    )
+    finishing: dict[int, Future] = {}
+    next_part: Future | None = None
+    failed = False
+
+    def settle(block: bool) -> None:
+        """Take in the finished parts; with block, wait for at least one."""
+        if not finishing:
+            return
+        wait(
+            list(finishing.values()),
+            timeout=None if block else 0,
+            return_when=FIRST_COMPLETED,
+        )
+        for index in sorted(finishing):
+            future = finishing[index]
+            if not future.done():
+                continue
+            del finishing[index]
+            try:
+                results[index] = future.result()
+            finally:
+                translation_config.cleanup_part_working_dir(index)
+        if finishing:
+            # Report the oldest part still going, so progress never goes back.
+            pm.reporting_part_index = min(finishing)
+
+    try:
+        for i in range(count):
+            while len(finishing) >= in_flight:
+                settle(block=True)
+            pm.reporting_part_index = min([*finishing, i])
+            if next_part is None:
+                prepared_part = _prepare_part(
+                    pm, translation_config, original_doc, split_points, i, run_context
+                )
+            else:
+                wait_start = time.time()
+                prepared_part = next_part.result()
+                next_part = None
+                logger.info(
+                    f"part {i} was prepared ahead, "
+                    f"waited {time.time() - wait_start:.1f}s for it"
+                )
+            if i + 1 < count:
+                next_part = prefetch.submit(
+                    _prepare_part,
+                    pm,
+                    translation_config,
+                    original_doc,
+                    split_points,
+                    i + 1,
+                    run_context,
+                )
+            if prepared_part is None:
+                results[i] = None
+                translation_config.cleanup_part_working_dir(i)
+                continue
+            finishing[i] = finisher.submit(_finish_single, prepared_part, run_context)
+            # Release this part's IR here; the finishing thread holds its own reference.
+            prepared_part = None
+            settle(block=False)
+        while finishing:
+            settle(block=True)
+    except Exception as e:
+        failed = True
+        logger.error(f"Error in part {pm.reporting_part_index}: {e}")
+        pm.translate_error(e)
+        raise
+    finally:
+        if (
+            failed
+            and pm.cancel_event is not None
+            and (finishing or (next_part is not None and not next_part.done()))
+        ):
+            # Stop the parts still going before their working directories go.
+            pm.cancel_event.set()
+        finisher.shutdown(wait=True)
+        prefetch.shutdown(wait=True)
+        for index, future in finishing.items():
+            translation_config.cleanup_part_working_dir(index)
+        if (
+            next_part is not None
+            and next_part.exception() is None
+            and next_part.result() is not None
+        ):
+            # Prepared ahead of a failure: it still holds its callback run and
+            # its input PDF.
+            next_part.result().close()
 
 
 def _prepare_part(
@@ -1323,7 +1401,8 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
     translation_config = prepared.config
     pm = prepared.pm
     finish_start = time.monotonic()
-    translation_service = None
+    term_service = None
+    run = None
     try:
         run = prepared.run
         writer_config, writer_assets, _ = _rust_writer_inputs(
@@ -1331,13 +1410,13 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
         )
         translator = translation_config.translator
         term_translator = translation_config.get_term_extraction_translator()
-        translation_service = RustTranslatorService(
-            translator, translation_config, run_context.shared_context
+        # Parts share the translator, its usage counters and the dispatchers, so
+        # the first part to translate makes the service for all of them.
+        translation_service = run_context.translation_service_for(
+            lambda: RustTranslatorService(
+                translator, translation_config, run_context.shared_context
+            )
         )
-        # The dispatchers belong to the whole document: bind them only here, once
-        # the part before has finished translating.
-        run_context.dispatcher_a.service = translation_service
-        run_context.dispatcher_b.service = translation_service
         term_service = RustTranslatorService(
             term_translator, translation_config, run_context.shared_context
         )
@@ -1361,8 +1440,7 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
         }
         prepared.services.update(services)
         run.add_services(services, record_requests=False)
-        run_context.dispatcher_a.cancel_flag = run.flag
-        run_context.dispatcher_b.cancel_flag = run.flag
+        run_context.live_part_flags.add(run.flag)
         writer_service = services["writer"][0]
         basename = Path(translation_config.input_file).stem
         debug_suffix = ".debug" if translation_config.debug else ""
@@ -1386,10 +1464,12 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
             prepared.capture_paths_json,
         )
     finally:
+        if run is not None:
+            run_context.live_part_flags.discard(run.flag)
         prepared.close()
-        if translation_service is not None:
-            translation_service.shutdown()
-        _log_part_timing(pm, translation_service, time.monotonic() - finish_start)
+        if term_service is not None:
+            term_service.shutdown()
+        _log_part_timing(pm, run_context, time.monotonic() - finish_start)
 
     result = TranslateResult(
         mono_pdf_path=None if mono_path is None else Path(mono_path),
@@ -1405,40 +1485,45 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
     return result
 
 
-def _log_part_timing(pm: ProgressMonitor, translation_service, seconds: float) -> None:
-    """One line per part: its stages and its translator requests."""
+def _translator_summary(run_context) -> str:
+    service = getattr(run_context, "translation_service", None)
+    return service.timing_summary() if service is not None else RequestLatency().summary()
+
+
+def _log_part_timing(pm: ProgressMonitor, run_context, seconds: float) -> None:
+    """One line per part: its stages, and for a whole document its requests.
+
+    Parts may translate at the same time and share one translation service,
+    so translator requests are counted for the document, not per part.
+    """
     try:
-        latency = getattr(translation_service, "latency", None) or RequestLatency()
-        translator = (
-            translation_service.timing_summary()
-            if translation_service is not None
-            else latency.summary()
-        )
         part = (pm.part_index or 0) + 1
-        logger.info(
-            f"part {part}/{pm.total_parts or 1} timing: translation onwards {seconds:.1f}s; "
-            f"stages: {stage_summary(pm.stage_seconds)}; translator: {translator}"
+        total = pm.total_parts or 1
+        line = (
+            f"part {part}/{total} timing: translation onwards {seconds:.1f}s; "
+            f"stages: {stage_summary(pm.stage_seconds)}"
         )
+        if total == 1:
+            line += f"; translator: {_translator_summary(run_context)}"
+        logger.info(line)
         root = pm.parent_monitor or pm
-        root.part_timings.append((dict(pm.stage_seconds), latency))
+        root.part_timings.append(dict(pm.stage_seconds))
     except Exception:
         logger.warning("could not log part timing", exc_info=True)
 
 
-def _log_document_timing(pm: ProgressMonitor, seconds: float) -> None:
-    """The sum over parts, when there is more than one."""
+def _log_document_timing(pm: ProgressMonitor, run_context, seconds: float) -> None:
+    """The sum over parts and the document's requests, when there is more than one part."""
     try:
         if len(pm.part_timings) < 2:
             return
         stages: dict[str, float] = {}
-        latency = RequestLatency()
-        for part_stages, part_latency in pm.part_timings:
+        for part_stages in pm.part_timings:
             for name, value in part_stages.items():
                 stages[name] = stages.get(name, 0.0) + value
-            latency.merge(part_latency)
         logger.info(
             f"document timing: {seconds:.1f}s over {len(pm.part_timings)} parts; "
-            f"stages: {stage_summary(stages)}; translator: {latency.summary()}"
+            f"stages: {stage_summary(stages)}; translator: {_translator_summary(run_context)}"
         )
     except Exception:
         logger.warning("could not log document timing", exc_info=True)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from concurrent.futures import Future
 from typing import Any
 
@@ -32,6 +33,35 @@ class PriorityServiceDispatcher:
         self.pool.shutdown(wait=True)
 
 
+class LivePartFlags:
+    """The cancellation flags of the parts still translating, checked as one.
+
+    The dispatchers belong to the whole document while parts may translate at
+    the same time. Each part's flag follows the document's cancel event only
+    until the part closes, so a request is checked against every live part's
+    flag rather than against whichever part bound the dispatcher last.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._flags: list = []
+
+    def add(self, flag) -> None:
+        with self._lock:
+            self._flags.append(flag)
+
+    def discard(self, flag) -> None:
+        with self._lock:
+            if flag in self._flags:
+                self._flags.remove(flag)
+
+    def checkpoint(self) -> None:
+        with self._lock:
+            flags = list(self._flags)
+        for flag in flags:
+            flag.checkpoint()
+
+
 class DocumentRunContext:
     """Python owner for native document handles and two independent dispatchers."""
 
@@ -49,6 +79,14 @@ class DocumentRunContext:
         self.dispatcher_a = dispatcher_a
         self.dispatcher_b = dispatcher_b
         self.font_source_styles = {}
+        # One translation service for the whole document, made by the first part
+        # that translates: parts may translate at the same time and share the
+        # dispatchers, so the service must outlive any one part.
+        self.translation_service = None
+        self.translation_service_lock = threading.Lock()
+        self.live_part_flags = LivePartFlags()
+        dispatcher_a.cancel_flag = self.live_part_flags
+        dispatcher_b.cancel_flag = self.live_part_flags
         self.native = _rust_il.DocumentRunContext(
             shared_context,
             font_mapper,
@@ -56,9 +94,20 @@ class DocumentRunContext:
             dispatcher_b,
         )
 
+    def translation_service_for(self, make):
+        """The document's translation service, made by `make()` on first use."""
+        with self.translation_service_lock:
+            if self.translation_service is None:
+                self.translation_service = make()
+                self.dispatcher_a.service = self.translation_service
+                self.dispatcher_b.service = self.translation_service
+            return self.translation_service
+
     def close(self):
         self.dispatcher_b.close()
         self.dispatcher_a.close()
+        if self.translation_service is not None:
+            self.translation_service.shutdown()
 
 
 def _font_assets(config):
