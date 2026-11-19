@@ -631,6 +631,36 @@ impl<'a> Lexer<'a> {
         .contains(&token)
             || is_glued_save_restore(token)
     }
+    // ASCIIHex and ASCII85 data end at their EOD marker, `>` and `~>`, which
+    // neither alphabet otherwise contains. pdfTeX, among others, writes EI
+    // right after it (`...>EI Q`), where the EI search wants whitespace, so
+    // end the data at the marker instead, as pdf.js does. Only the first
+    // filter sees the bytes as stored.
+    fn inline_ascii_end(&mut self, dict: &[(String, Token)], start: usize) -> Option<usize> {
+        let filter = dict.iter().find(|(k, _)| k == "F" || k == "Filter").map(|(_, v)| v)?;
+        let first = match filter {
+            Token::Array(filters) => filters.first()?,
+            filter => filter,
+        };
+        let eod: &[u8] = match first {
+            Token::Name(n) if n == "AHx" || n == "ASCIIHexDecode" => b">",
+            Token::Name(n) if n == "A85" || n == "ASCII85Decode" => b"~>",
+            _ => return None,
+        };
+        let data = self.b.get(start..)?;
+        let end = start + data.windows(eod.len()).position(|w| w == eod)? + eod.len();
+        let mut probe = end;
+        while self.b.get(probe).is_some_and(|b| ws(*b)) {
+            probe += 1;
+        }
+        if self.b.get(probe..probe + 2) != Some(b"EI".as_slice())
+            || !self.b.get(probe + 2).is_none_or(|b| delim(*b))
+        {
+            return None;
+        }
+        self.p = probe + 2;
+        Some(end)
+    }
     pub fn operation(&mut self) -> Result<Option<Operation>> {
         let mut args = Vec::new();
         while let Some(t) = self.token(0)? {
@@ -703,6 +733,7 @@ impl<'a> Lexer<'a> {
                             }
                         }
                     }
+                    let exact_end = exact_end.or_else(|| self.inline_ascii_end(&dict, start));
                     let end = if let Some(end) = exact_end {
                         end
                     } else {
