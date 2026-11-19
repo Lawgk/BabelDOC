@@ -1387,6 +1387,8 @@ def _finish_single(prepared: _PreparedPart, run_context) -> TranslateResult:
         )
     finally:
         prepared.close()
+        if translation_service is not None:
+            translation_service.shutdown()
         _log_part_timing(pm, translation_service, time.monotonic() - finish_start)
 
     result = TranslateResult(
@@ -1407,10 +1409,15 @@ def _log_part_timing(pm: ProgressMonitor, translation_service, seconds: float) -
     """One line per part: its stages and its translator requests."""
     try:
         latency = getattr(translation_service, "latency", None) or RequestLatency()
+        translator = (
+            translation_service.timing_summary()
+            if translation_service is not None
+            else latency.summary()
+        )
         part = (pm.part_index or 0) + 1
         logger.info(
             f"part {part}/{pm.total_parts or 1} timing: translation onwards {seconds:.1f}s; "
-            f"stages: {stage_summary(pm.stage_seconds)}; translator: {latency.summary()}"
+            f"stages: {stage_summary(pm.stage_seconds)}; translator: {translator}"
         )
         root = pm.parent_monitor or pm
         root.part_timings.append((dict(pm.stage_seconds), latency))

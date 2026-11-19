@@ -6,6 +6,8 @@ import re
 import threading
 from typing import Any
 
+from babeldoc.hedging import Hedger
+from babeldoc.hedging import hedge_after
 from babeldoc.timing import RequestLatency
 
 
@@ -26,6 +28,8 @@ class RustTranslatorService:
         self._regex_keys: dict[tuple[str, int], int] = {}
         self._next_regex_id = 0
         self.latency = RequestLatency()
+        after = hedge_after()
+        self.hedger = Hedger(after) if after is not None else None
 
     def supports_llm(self) -> bool:
         """Match high_level.translator_supports_llm, including its broad catch."""
@@ -96,10 +100,23 @@ class RustTranslatorService:
     def llm_translate(
         self, prompt: str, rate_limit_params: dict[str, Any] | None = None
     ):
-        with self.latency.measure("llm_translate"):
+        def call():
             return self.translator.llm_translate(
                 prompt, rate_limit_params=rate_limit_params
             )
+
+        with self.latency.measure("llm_translate"):
+            return call() if self.hedger is None else self.hedger.call(call)
+
+    def timing_summary(self) -> str:
+        summary = self.latency.summary()
+        if self.hedger is not None:
+            summary += f", {self.hedger.summary()}"
+        return summary
+
+    def shutdown(self) -> None:
+        if self.hedger is not None:
+            self.hedger.close()
 
     def regex_compile(self, pattern: str, flags: int = 0) -> int:
         key = (pattern, flags)
