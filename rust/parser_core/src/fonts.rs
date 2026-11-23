@@ -1071,6 +1071,8 @@ fn populate_simple_tables(
     out: &mut FontBackend,
 ) -> Result<bool, FontError> {
     let mut metrics_replaced = false;
+    // The metrics below rename TimesNewRoman, Arial... to their base-14 stand-ins.
+    let base_font = out.font_name.clone();
     if out.subtype != "Type3" {
         {
             if let Some(entry) = FONT_METRICS.get(&out.font_name).and_then(|v| v.as_array()) {
@@ -1151,7 +1153,7 @@ fn populate_simple_tables(
         }
     }
     let numeric = if out.subtype != "Type3" {
-        numeric_glyph_names(doc, &differences, &unicode, &out.font_name)?
+        numeric_glyph_names(doc, &differences, &unicode, &base_font)?
     } else {
         None
     };
@@ -1178,17 +1180,24 @@ fn populate_simple_tables(
 
 /// Decode Differences that name every glyph /C<n> after its old code.
 ///
-/// PDFlib PLOP rewrites of Advent 3B2 journal PDFs renumber each subset
-/// font to codes 1..N, name glyph /C<n> after its code n in the original
-/// font and drop ToUnicode. AGL knows none of these names, so the codes
-/// fall back to the base encoding and decode as (cid:N) or shifted ASCII;
-/// too few to trip the CID checks, the garbage gets translated.
+/// Advent 3B2 journal PDFs, as Distiller wrote them and as PDFlib PLOP
+/// rewrote them, renumber each subset font to codes 1..N, name glyph /C<n>
+/// after its code n in the original font and drop ToUnicode. AGL knows none
+/// of these names, so the codes fall back to the base encoding and decode as
+/// (cid:N) or shifted ASCII: the garbage gets translated, or the document
+/// fails as undecodable.
+///
+/// As AGL prescribes, a name counts up to its first period: 3B2 text fonts
+/// carry an alternate parenthesis /C40._. Codes 128 and 129 of the Advent
+/// text fonts are the ff and ffi ligatures, which no base encoding has.
 ///
 /// Symbol fonts are named the same way, but their original codes are not
 /// base-encoding characters (/C97 is alpha), and nothing in the font tells
-/// them apart. Fonts named as symbol fonts, fonts with codes the base
-/// encoding lacks, and subsets of one or two glyphs (too small to judge)
-/// keep the old decoding; their CID characters render as original glyphs.
+/// them apart. Fonts named as symbol fonts and subsets of one or two glyphs
+/// (too small to judge) keep the old decoding, and so do fonts with codes
+/// the base encoding lacks, unless at most two such codes sit among at least
+/// 20 decodable glyphs; those codes alone then stay undecoded. Undecoded
+/// characters render as original glyphs.
 fn numeric_glyph_names(
     doc: &Document,
     differences: &[Object],
@@ -1204,7 +1213,9 @@ fn numeric_glyph_names(
     if symbol_font || differences.is_empty() {
         return Ok(None);
     }
+    let advent = without_subset_tag(font_name).starts_with("Adv");
     let mut decoded = BTreeMap::new();
+    let mut outside = 0usize;
     let mut cid = 0i128;
     for item in differences {
         if let Object::Integer(n) = item {
@@ -1212,22 +1223,39 @@ fn numeric_glyph_names(
             continue;
         }
         let glyph = name(doc, Some(item), "")?;
-        let Some(text) = glyph
-            .strip_prefix('C')
+        let Some(original) = glyph
+            .split('.')
+            .next()
+            .and_then(|stem| stem.strip_prefix('C'))
             .filter(|digits| {
                 (1..=3).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
             })
             .and_then(|digits| digits.parse::<u32>().ok())
-            .and_then(|code| base.get(&code))
         else {
             return Ok(None);
         };
-        if let Ok(code) = u32::try_from(cid) {
-            decoded.insert(code, text.clone());
+        let text = match original {
+            128 if advent => Some("ff".to_owned()),
+            129 if advent => Some("ffi".to_owned()),
+            _ => base.get(&original).cloned(),
+        };
+        match (text, u32::try_from(cid)) {
+            (Some(text), Ok(code)) => {
+                decoded.insert(code, text);
+            }
+            (None, _) => outside += 1,
+            _ => {}
         }
         cid += 1;
     }
-    Ok((decoded.len() > 2).then_some(decoded))
+    let trusted = outside == 0 || (outside <= 2 && decoded.len() >= 20);
+    Ok((trusted && decoded.len() > 2).then_some(decoded))
+}
+
+fn without_subset_tag(font_name: &str) -> &str {
+    font_name
+        .split_once('+')
+        .map_or(font_name, |(_, name)| name)
 }
 
 fn stream_length1<'a>(doc: &'a Document, font_file: &'a Object) -> Option<&'a Object> {
