@@ -1,3 +1,4 @@
+import pytest
 from conftest import build_pdf
 
 
@@ -95,3 +96,50 @@ def test_many_codes_outside_the_base_encoding_leave_the_font_undecoded(tmp_path)
 def test_partly_numeric_names_keep_the_existing_decoding(tmp_path):
     text = _text(tmp_path, "ABCDEF+Body", ["A", *_numeric(66, 67)])
     assert text == "A(cid:2)(cid:3)"
+
+
+def _glyph_indexes(*indexes: int) -> list[str]:
+    return [f"g{index}" for index in indexes]
+
+
+# "The (1)" as PScript5 names the glyphs of a TrueType font it sends as Type1.
+THE_ONE = _glyph_indexes(55, 75, 72, 3, 11, 20, 12)
+
+
+@pytest.mark.parametrize(
+    "basefont",
+    [
+        "JDPGHJ+TimesNewRomanPSMT",
+        "TimesNewRoman,Bold",  # renamed to Times-Bold by the base-14 metrics
+        "JDPHAL+ArialMT",
+        "JDPGJL+ArialNarrow-Bold",
+        "ABCDEF+CourierNewPSMT",
+        "KACLJH+LiberationSerif",
+    ],
+)
+def test_glyph_indexes_of_known_fonts_decode(tmp_path, basefont):
+    assert _text(tmp_path, basefont, THE_ONE) == "The (1)"
+
+
+def test_core_fonts_decode_glyph_indexes_up_to_171(tmp_path):
+    # 112 is eacute and 171 ellipsis; 183 is quoteright in the Macintosh
+    # order but not in Times New Roman.
+    names = _glyph_indexes(55, 75, 72, 3, 112, 171, 183)
+    assert _text(tmp_path, "JDPGHJ+TimesNewRomanPSMT", names) == "The é…(cid:7)"
+
+
+def test_liberation_fonts_decode_ascii_glyph_indexes_only(tmp_path):
+    names = _glyph_indexes(55, 75, 72, 3, 112)
+    assert _text(tmp_path, "KACLJH+LiberationSerif", names) == "The (cid:5)"
+
+
+@pytest.mark.parametrize(
+    "basefont", ["ABCDEF+Calibri", "ABCDEF+ArialUnicodeMS", "ABCDEF+ArialNova"]
+)
+def test_glyph_indexes_of_other_fonts_stay_undecoded(tmp_path, basefont):
+    assert _text(tmp_path, basefont, THE_ONE) == _undecoded(len(THE_ONE))
+
+
+def test_partly_indexed_names_keep_the_existing_decoding(tmp_path):
+    names = ["g55", "A", "g72"]
+    assert _text(tmp_path, "ABCDEF+TimesNewRomanPSMT", names) == "(cid:1)A(cid:3)"

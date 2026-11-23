@@ -1153,7 +1153,10 @@ fn populate_simple_tables(
         }
     }
     let numeric = if out.subtype != "Type3" {
-        numeric_glyph_names(doc, &differences, &unicode, &base_font)?
+        match numeric_glyph_names(doc, &differences, &unicode, &base_font)? {
+            Some(decoded) => Some(decoded),
+            None => glyph_index_names(doc, &differences, &base_font)?,
+        }
     } else {
         None
     };
@@ -1250,6 +1253,115 @@ fn numeric_glyph_names(
     }
     let trusted = outside == 0 || (outside <= 2 && decoded.len() >= 20);
     Ok((trusted && decoded.len() > 2).then_some(decoded))
+}
+
+/// Glyphs 0-171 of the Macintosh standard order (TrueType 'post' format 1).
+#[rustfmt::skip]
+const MAC_GLYPH_ORDER: [&str; 172] = [
+    ".notdef", ".null", "nonmarkingreturn", "space", "exclam", "quotedbl", "numbersign", "dollar",
+    "percent", "ampersand", "quotesingle", "parenleft", "parenright", "asterisk", "plus", "comma",
+    "hyphen", "period", "slash", "zero", "one", "two", "three", "four",
+    "five", "six", "seven", "eight", "nine", "colon", "semicolon", "less",
+    "equal", "greater", "question", "at", "A", "B", "C", "D",
+    "E", "F", "G", "H", "I", "J", "K", "L",
+    "M", "N", "O", "P", "Q", "R", "S", "T",
+    "U", "V", "W", "X", "Y", "Z", "bracketleft", "backslash",
+    "bracketright", "asciicircum", "underscore", "grave", "a", "b", "c", "d",
+    "e", "f", "g", "h", "i", "j", "k", "l",
+    "m", "n", "o", "p", "q", "r", "s", "t",
+    "u", "v", "w", "x", "y", "z", "braceleft", "bar",
+    "braceright", "asciitilde", "Adieresis", "Aring", "Ccedilla", "Eacute", "Ntilde", "Odieresis",
+    "Udieresis", "aacute", "agrave", "acircumflex", "adieresis", "atilde", "aring", "ccedilla",
+    "eacute", "egrave", "ecircumflex", "edieresis", "iacute", "igrave", "icircumflex", "idieresis",
+    "ntilde", "oacute", "ograve", "ocircumflex", "odieresis", "otilde", "uacute", "ugrave",
+    "ucircumflex", "udieresis", "dagger", "degree", "cent", "sterling", "section", "bullet",
+    "paragraph", "germandbls", "registered", "copyright", "trademark", "acute", "dieresis", "notequal",
+    "AE", "Oslash", "infinity", "plusminus", "lessequal", "greaterequal", "yen", "mu",
+    "partialdiff", "summation", "product", "pi", "integral", "ordfeminine", "ordmasculine", "Omega",
+    "ae", "oslash", "questiondown", "exclamdown", "logicalnot", "radical", "florin", "approxequal",
+    "Delta", "guillemotleft", "guillemotright", "ellipsis",
+];
+
+/// Names of the Microsoft core fonts decoded by `glyph_index_names`, besides
+/// plain "Arial".
+const CORE_FONT_PREFIXES: [&str; 8] = [
+    "TimesNewRoman",
+    "CourierNew",
+    "ArialMT",
+    "Arial-",
+    "Arial,",
+    "ArialNarrow",
+    "ArialBlack",
+    "ArialRounded",
+];
+
+/// Decode Differences that name every glyph /g<n> after its glyph index in
+/// a Microsoft core or Liberation TrueType font.
+///
+/// The Windows PostScript driver (PScript5) can send TrueType fonts as Type1
+/// fonts whose glyphs are named /g<n> after their glyph index n. Distiller
+/// keeps the names and writes no ToUnicode, so the codes fall back to the
+/// base encoding and the document fails as undecodable.
+///
+/// A glyph index means nothing without the font, so only fonts whose glyph
+/// order is known are decoded. In Times New Roman, Courier New and Arial
+/// (with Narrow, Black and Rounded, but not Arial Unicode or Nova), glyphs
+/// 3-171 follow the Macintosh standard order, except 155 (pi there), which
+/// these fonts lack; later glyphs differ between fonts of the family.
+/// Liberation fonts follow it for ASCII only (3-97); their later glyphs
+/// moved between versions. Other glyphs, other fonts and subsets of one or
+/// two glyphs keep the old decoding and render as original glyphs.
+fn glyph_index_names(
+    doc: &Document,
+    differences: &[Object],
+    font_name: &str,
+) -> Result<Option<BTreeMap<u32, String>>, FontError> {
+    let family: String = without_subset_tag(font_name)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
+    let core = family == "Arial"
+        || CORE_FONT_PREFIXES
+            .iter()
+            .any(|prefix| family.starts_with(prefix));
+    let last = if family.starts_with("Liberation") {
+        97
+    } else if core {
+        171
+    } else {
+        return Ok(None);
+    };
+    if differences.is_empty() {
+        return Ok(None);
+    }
+    let mut decoded = BTreeMap::new();
+    let mut cid = 0i128;
+    for item in differences {
+        if let Object::Integer(n) = item {
+            cid = *n as i128;
+            continue;
+        }
+        let glyph = name(doc, Some(item), "")?;
+        let Some(index) = glyph
+            .strip_prefix('g')
+            .filter(|digits| {
+                (1..=5).contains(&digits.len()) && digits.bytes().all(|b| b.is_ascii_digit())
+            })
+            .and_then(|digits| digits.parse::<usize>().ok())
+        else {
+            return Ok(None);
+        };
+        if (3..=last).contains(&index) && index != 155 {
+            if let (Some(text), Ok(code)) = (
+                glyph_name_unicode(MAC_GLYPH_ORDER[index]),
+                u32::try_from(cid),
+            ) {
+                decoded.insert(code, text);
+            }
+        }
+        cid += 1;
+    }
+    Ok((decoded.len() > 2).then_some(decoded))
 }
 
 fn without_subset_tag(font_name: &str) -> &str {
